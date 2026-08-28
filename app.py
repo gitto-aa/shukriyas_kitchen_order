@@ -239,7 +239,7 @@ def create_staff_order(order_taker, customer, phone, address, notes, cart, deliv
 
 
 def create_public_order(customer, phone, address, notes, cart):
-    payload = [{"menu_option_id": int(i["option_id"]), "qty": int(i["qty"])} for i in cart]
+    payload = [{"menu_option_id": int(i["option_id"]), "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"])} for i in cart]
     r = get_db().rpc("create_public_order", {"p_customer": customer, "p_phone": phone, "p_address": address or None,
         "p_notes": notes or None, "p_items": payload}).execute()
     if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
@@ -296,16 +296,35 @@ with public_tab:
             format_func=lambda oid: f"{dish_df.loc[dish_df['option_id']==oid, 'option'].iloc[0]} — {money(dish_df.loc[dish_df['option_id']==oid, 'price'].iloc[0])}",
             key="public_option")
         qcol, acol = st.columns([1,2])
-        with qcol:
-            qty = st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1, key="public_qty")
         selected = dish_df.loc[dish_df["option_id"] == option_id].iloc[0]
+        with qcol:
+            if str(category).strip().casefold() == "main":
+                tray_choices = [
+                    (0.5, "1/2 tray"),
+                    (1.0, "1 tray"),
+                    (1.5, "1 1/2 trays"),
+                    (2.0, "2 trays"),
+                    (2.5, "2 1/2 trays"),
+                    (3.0, "3 trays"),
+                    (3.5, "3 1/2 trays"),
+                    (4.0, "4 trays"),
+                    (4.5, "4 1/2 trays"),
+                    (5.0, "5 trays"),
+                ]
+                tray_label = st.selectbox("Tray quantity", [label for _, label in tray_choices], index=1, key="public_tray_qty")
+                qty = next(value for value, label in tray_choices if label == tray_label)
+                quantity_label = tray_label
+                st.caption(f"Price shown is per tray: {money(float(selected['price']))}")
+            else:
+                qty = float(st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1, key="public_qty"))
+                quantity_label = str(int(qty))
         with acol:
             st.write("")
             st.write("")
             if st.button("Add to cart", type="primary", use_container_width=True):
                 st.session_state.public_cart.append({"option_id": int(option_id), "dish": dish,
-                    "option": str(selected["option"]), "qty": int(qty), "price": float(selected["price"]),
-                    "line_total": int(qty)*float(selected["price"])})
+                    "option": str(selected["option"]), "qty": float(qty), "quantity_label": quantity_label,
+                    "price": float(selected["price"]), "line_total": float(qty)*float(selected["price"])})
                 st.session_state.public_confirmation = None
                 st.rerun()
 
@@ -316,7 +335,7 @@ with public_tab:
             for i, item in enumerate(st.session_state.public_cart):
                 c1,c2,c3,c4 = st.columns([3.5,1.2,1.4,.7])
                 c1.write(f"**{item['dish']}**  \n{item['option']}")
-                c2.write(f"× {item['qty']}")
+                c2.write(f"× {item.get('quantity_label') or item['qty']}")
                 c3.write(money(item["line_total"]))
                 if c4.button("✕", key=f"public_remove_{i}"):
                     st.session_state.public_cart.pop(i); st.rerun()

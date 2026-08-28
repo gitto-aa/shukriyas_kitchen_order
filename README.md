@@ -1,1 +1,1 @@
-v35 makes order notes bold and prominent on PDF, print, and invoice preview.
+v36 adds Tray as a standard selling format alongside Piece, Small Box, Box, and Half Tray.

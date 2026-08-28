@@ -1663,7 +1663,7 @@ with manager_tab:
             st.subheader("Menu management")
             st.caption("A dish can be sold in one or several formats. Select every format that applies and set its price.")
 
-            STANDARD_FORMATS = ["Piece", "Small Box", "Box", "Half Tray"]
+            STANDARD_FORMATS = ["Piece", "Small Box", "Box", "Half Tray", "Tray"]
 
             try:
                 all_menu = load_all_menu_items()
@@ -1771,7 +1771,7 @@ with manager_tab:
                             except Exception as exc:
                                 st.error(f"Could not update dish: {exc}")
 
-                st.caption("You can select multiple formats for the same dish, for example **Box + Half Tray**. Existing special formats are preserved unless we explicitly convert them later.")
+                st.caption("You can select multiple formats for the same dish, for example **Box + Half Tray + Tray**. Existing special formats are preserved unless we explicitly convert them later.")
 
         with announcement_tab:
             st.subheader("Customer announcements")

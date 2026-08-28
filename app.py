@@ -1676,35 +1676,60 @@ with manager_tab:
                 category_options = ["Bangla items", "Chinese", "Dessert", "Frozen"]
 
             with st.expander("➕ Add new dish", expanded=all_menu.empty):
-                with st.form("add_menu_item_form", clear_on_submit=True):
-                    a1, a2 = st.columns([2, 1.3])
-                    new_dish = a1.text_input("Dish name")
-                    new_category = a2.selectbox("Category", category_options, key="new_menu_category")
-                    new_formats = st.multiselect("How is it sold?", STANDARD_FORMATS, placeholder="Select one or more")
-                    new_units = []
-                    if new_formats:
-                        st.caption("Set the price for each selected selling format.")
-                    cols = st.columns(2)
-                    for idx, label in enumerate(STANDARD_FORMATS):
-                        if label in new_formats:
-                            with cols[idx % 2]:
-                                price = st.number_input(f"{label} price", min_value=0.0, value=0.0, step=.5, format="%.2f", key=f"new_{label}_price")
-                                min_qty = 1
-                                if label == "Piece":
-                                    min_qty = st.number_input("Minimum order (pieces)", min_value=1, value=1, step=1, key="new_piece_min")
-                                new_units.append({"label": label, "price": float(price), "min_order_qty": float(min_qty)})
-                    new_available = st.checkbox("Available to customers", value=True)
-                    add_item = st.form_submit_button("Add dish", type="primary", use_container_width=True)
-                    if add_item:
-                        if not new_formats:
-                            st.error("Select at least one selling format.")
-                        else:
-                            try:
-                                save_menu_item(None, new_dish, new_category, new_available, new_units)
-                                st.success("Dish added.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Could not add dish: {exc}")
+                a1, a2 = st.columns([2, 1.3])
+                new_dish = a1.text_input("Dish name", key="new_menu_dish")
+                new_category = a2.selectbox("Category", category_options, key="new_menu_category")
+                new_formats = st.multiselect(
+                    "How is it sold?",
+                    STANDARD_FORMATS,
+                    placeholder="Select one or more",
+                    key="new_menu_formats",
+                )
+                new_units = []
+                if new_formats:
+                    st.caption("Set the price only for the selected selling formats.")
+                    price_cols = st.columns(2)
+                    for idx, label in enumerate(new_formats):
+                        with price_cols[idx % 2]:
+                            price = st.number_input(
+                                f"{label} price",
+                                min_value=0.0,
+                                value=0.0,
+                                step=.5,
+                                format="%.2f",
+                                key=f"new_{label}_price",
+                            )
+                            min_qty = 1
+                            if label == "Piece":
+                                min_qty = st.number_input(
+                                    "Minimum order (pieces)",
+                                    min_value=1,
+                                    value=1,
+                                    step=1,
+                                    key="new_piece_min",
+                                )
+                            new_units.append({"label": label, "price": float(price), "min_order_qty": float(min_qty)})
+                else:
+                    st.caption("Select one or more selling formats to enter pricing.")
+
+                new_available = st.checkbox("Available to customers", value=True, key="new_menu_available")
+                add_item = st.button("Add dish", type="primary", use_container_width=True, key="add_menu_item_button")
+                if add_item:
+                    if not new_dish.strip():
+                        st.error("Enter a dish name.")
+                    elif not new_formats:
+                        st.error("Select at least one selling format.")
+                    else:
+                        try:
+                            save_menu_item(None, new_dish, new_category, new_available, new_units)
+                            st.success("Dish added.")
+                            for key in ["new_menu_dish", "new_menu_formats", "new_menu_available", "new_piece_min"]:
+                                st.session_state.pop(key, None)
+                            for label in STANDARD_FORMATS:
+                                st.session_state.pop(f"new_{label}_price", None)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not add dish: {exc}")
 
             if all_menu.empty:
                 st.info("No menu items yet.")
@@ -1730,46 +1755,64 @@ with manager_tab:
                 selected_standard = [f for f in STANDARD_FORMATS if f in active_options]
                 custom_active = [o for o in option_details if o["active"] and o["label"] not in STANDARD_FORMATS and o["label"] != "Standard"]
 
-                with st.form(f"edit_menu_item_{selected_id}"):
-                    e1, e2 = st.columns([2, 1.3])
-                    edit_dish = e1.text_input("Dish name", value=str(selected_row["dish"]))
-                    current_category = str(selected_row["category"] or "").strip()
-                    edit_category_options = category_options.copy()
-                    if current_category and current_category not in edit_category_options:
-                        edit_category_options.append(current_category)
-                        edit_category_options = sorted(edit_category_options)
-                    edit_category = e2.selectbox(
-                        "Category",
-                        edit_category_options,
-                        index=edit_category_options.index(current_category) if current_category in edit_category_options else 0,
-                        key=f"edit_menu_category_{selected_id}",
-                    )
-                    edit_formats = st.multiselect("How is it sold?", STANDARD_FORMATS, default=selected_standard)
-                    if custom_active:
-                        st.caption("Existing special formats preserved: " + ", ".join(f"{o['label']} ({money(o['price'])})" for o in custom_active))
-                    edit_units = []
-                    cols = st.columns(2)
-                    for idx, label in enumerate(STANDARD_FORMATS):
-                        if label in edit_formats:
-                            current = active_options.get(label, {})
-                            with cols[idx % 2]:
-                                price = st.number_input(f"{label} price", min_value=0.0, value=float(current.get("price", selected_row.get("price") or 0)), step=.5, format="%.2f", key=f"edit_{selected_id}_{label}_price")
-                                min_qty = 1
-                                if label == "Piece":
-                                    min_qty = st.number_input("Minimum order (pieces)", min_value=1, value=max(1, int(round(float(current.get("min_order_qty", 1))))), step=1, key=f"edit_{selected_id}_piece_min")
-                                edit_units.append({"label": label, "price": float(price), "min_order_qty": float(min_qty)})
-                    edit_available = st.checkbox("Available to customers", value=bool(selected_row["available"]))
-                    save_item = st.form_submit_button("Save changes", type="primary", use_container_width=True)
-                    if save_item:
-                        if not edit_formats and not custom_active:
-                            st.error("Select at least one selling format.")
-                        else:
-                            try:
-                                save_menu_item(int(selected_id), edit_dish, edit_category, edit_available, edit_units)
-                                st.success("Menu item updated.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Could not update dish: {exc}")
+                e1, e2 = st.columns([2, 1.3])
+                edit_dish = e1.text_input("Dish name", value=str(selected_row["dish"]), key=f"edit_menu_dish_{selected_id}")
+                current_category = str(selected_row["category"] or "").strip()
+                edit_category_options = category_options.copy()
+                if current_category and current_category not in edit_category_options:
+                    edit_category_options.append(current_category)
+                    edit_category_options = sorted(edit_category_options)
+                edit_category = e2.selectbox(
+                    "Category",
+                    edit_category_options,
+                    index=edit_category_options.index(current_category) if current_category in edit_category_options else 0,
+                    key=f"edit_menu_category_{selected_id}",
+                )
+                edit_formats = st.multiselect(
+                    "How is it sold?",
+                    STANDARD_FORMATS,
+                    default=selected_standard,
+                    key=f"edit_menu_formats_{selected_id}",
+                )
+                if custom_active:
+                    st.caption("Existing special formats preserved: " + ", ".join(f"{o['label']} ({money(o['price'])})" for o in custom_active))
+                edit_units = []
+                if edit_formats:
+                    st.caption("Set the price only for the selected selling formats.")
+                    edit_cols = st.columns(2)
+                    for idx, label in enumerate(edit_formats):
+                        current = active_options.get(label, {})
+                        with edit_cols[idx % 2]:
+                            price = st.number_input(
+                                f"{label} price",
+                                min_value=0.0,
+                                value=float(current.get("price", selected_row.get("price") or 0)),
+                                step=.5,
+                                format="%.2f",
+                                key=f"edit_{selected_id}_{label}_price",
+                            )
+                            min_qty = 1
+                            if label == "Piece":
+                                min_qty = st.number_input(
+                                    "Minimum order (pieces)",
+                                    min_value=1,
+                                    value=max(1, int(round(float(current.get("min_order_qty", 1))))),
+                                    step=1,
+                                    key=f"edit_{selected_id}_piece_min",
+                                )
+                            edit_units.append({"label": label, "price": float(price), "min_order_qty": float(min_qty)})
+                edit_available = st.checkbox("Available to customers", value=bool(selected_row["available"]), key=f"edit_available_{selected_id}")
+                save_item = st.button("Save changes", type="primary", use_container_width=True, key=f"save_menu_item_{selected_id}")
+                if save_item:
+                    if not edit_formats and not custom_active:
+                        st.error("Select at least one selling format.")
+                    else:
+                        try:
+                            save_menu_item(int(selected_id), edit_dish, edit_category, edit_available, edit_units)
+                            st.success("Menu item updated.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not update dish: {exc}")
 
                 st.caption("You can select multiple formats for the same dish, for example **Box + Half Tray + Tray**. Existing special formats are preserved unless we explicitly convert them later.")
 

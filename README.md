@@ -1,1 +1,1 @@
-v36 adds Tray as a standard selling format alongside Piece, Small Box, Box, and Half Tray.
+v37 makes menu pricing fields appear dynamically based on selected selling formats.

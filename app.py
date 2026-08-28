@@ -52,7 +52,7 @@ def first_secret(*names: str) -> str:
     return ""
 
 
-BUSINESS_NAME = setting("BUSINESS_NAME", "My Home Kitchen")
+BUSINESS_NAME = setting("BUSINESS_NAME", "Shukiyra's Kitchen")
 BUSINESS_PHONE = setting("BUSINESS_PHONE", "")
 BUSINESS_ADDRESS = setting("BUSINESS_ADDRESS", "")
 CURRENCY = setting("CURRENCY", "$")
@@ -360,7 +360,7 @@ def require_password() -> None:
     if st.session_state.get("app_authenticated"):
         return
 
-    st.title("🍽️ Home Kitchen Orders")
+    st.title("🍽️ Shukirya's Kitchen")
     st.caption("Enter the shared app password to continue.")
     entered = st.text_input("App password", type="password")
     if st.button("Sign in", type="primary"):

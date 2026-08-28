@@ -1455,6 +1455,9 @@ with manager_tab:
 
                     st.markdown("**Quantity**")
                     minus_col, qty_col, plus_col = st.columns([1, 1.35, 1])
+
+                    # Run both button actions before the number_input is instantiated.
+                    # This lets the same value be changed either with −/+ or by typing.
                     if minus_col.button(
                         "−",
                         key=f"staff_add_minus_{item_id}_{option_id}",
@@ -1463,18 +1466,25 @@ with manager_tab:
                     ):
                         st.session_state[qty_key] = max(minimum_qty, int(st.session_state[qty_key]) - 1)
                         st.rerun()
-                    qv = float(int(st.session_state[qty_key]))
-                    qty_col.markdown(
-                        f"<div style='text-align:center;padding:.55rem .1rem;font-size:1.05rem;font-weight:700'>{int(qv)}</div>",
-                        unsafe_allow_html=True,
-                    )
                     if plus_col.button(
                         "+",
                         key=f"staff_add_plus_{item_id}_{option_id}",
+                        disabled=int(st.session_state[qty_key]) >= 100,
                         use_container_width=True,
                     ):
                         st.session_state[qty_key] = min(100, int(st.session_state[qty_key]) + 1)
                         st.rerun()
+
+                    with qty_col:
+                        typed_qty = st.number_input(
+                            "Quantity",
+                            min_value=int(minimum_qty),
+                            max_value=100,
+                            step=1,
+                            key=qty_key,
+                            label_visibility="collapsed",
+                        )
+                    qv = float(int(typed_qty))
 
                     if option_label.casefold() == "piece":
                         ql = f"{int(qv)} piece" if int(qv) == 1 else f"{int(qv)} pieces"

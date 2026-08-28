@@ -1,1 +1,1 @@
-v32 adds PAID watermark and payment details to invoices.
+v33 makes the staff-order quantity field directly editable while retaining minus/plus buttons and minimum quantity enforcement.

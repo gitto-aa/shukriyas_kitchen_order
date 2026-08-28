@@ -641,9 +641,12 @@ def render_print_button(order: dict, label: str = "🖨️ Print invoice") -> No
     button_label = json.dumps(label)
     components.html(
         f"""
+        <style>
+          html, body {{ margin:0 !important; padding:0 !important; overflow:hidden; }}
+        </style>
         <div style="margin:0;padding:0;color-scheme:light dark;">
           <button id="printInvoice" type="button" style="
-            width:100%; min-height:40px; border-radius:8px;
+            width:100%; height:40px; min-height:40px; border-radius:8px;
             border:1px solid GrayText; background:transparent; color:CanvasText;
             font:600 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             cursor:pointer; padding:8px 12px;">
@@ -671,7 +674,7 @@ def render_print_button(order: dict, label: str = "🖨️ Print invoice") -> No
           }});
         </script>
         """,
-        height=48,
+        height=40,
         scrolling=False,
     )
 

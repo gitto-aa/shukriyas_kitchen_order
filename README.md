@@ -11,3 +11,7 @@ This version keeps the existing public ordering, manager dashboard, announcement
 - Larger orders can still continue onto additional pages when needed.
 
 No Supabase migration is required for v20. Replace `app.py` (or deploy the full project) and restart the Streamlit app.
+
+## v22
+- Aligns the manager Download invoice and Print invoice controls on the same horizontal baseline.
+- Removes the embedded print component's default browser body margin and matches the native Streamlit button height.

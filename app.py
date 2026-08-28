@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from fractions import Fraction
-import re
 from html import escape
 from io import BytesIO
 from zoneinfo import ZoneInfo
+import os
 
 import pandas as pd
 import streamlit as st
@@ -17,8 +17,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from supabase import Client, create_client
 
-
-st.set_page_config(page_title="Shukriya's Kitchen", page_icon="🍽️", layout="centered")
+st.set_page_config(page_title="Shukriya's Kitchen Orders", page_icon="🍽️", layout="centered")
 
 
 def setting(name: str, default: str = "") -> str:
@@ -36,9 +35,6 @@ def nested_secret(section: str, name: str, default: str = "") -> str:
 
 
 def first_secret(*names: str) -> str:
-    """Return the first non-empty top-level Streamlit secret or environment variable."""
-    import os
-
     for name in names:
         try:
             value = st.secrets.get(name, "")
@@ -52,18 +48,14 @@ def first_secret(*names: str) -> str:
     return ""
 
 
-BUSINESS_NAME = setting("BUSINESS_NAME", "My Home Kitchen")
+BUSINESS_NAME = setting("BUSINESS_NAME", "Shukriya's Kitchen")
 BUSINESS_PHONE = setting("BUSINESS_PHONE", "")
 BUSINESS_ADDRESS = setting("BUSINESS_ADDRESS", "")
 CURRENCY = setting("CURRENCY", "$")
 APP_TIMEZONE = setting("APP_TIMEZONE", "America/Los_Angeles")
 APP_PASSWORD = setting("APP_PASSWORD", "")
 
-# Prefer simple top-level Streamlit secrets. Keep nested names for backward compatibility.
-SUPABASE_URL = (
-    first_secret("SUPABASE_URL", "supabase_url")
-    or nested_secret("supabase", "url")
-).strip()
+SUPABASE_URL = (first_secret("SUPABASE_URL", "supabase_url") or nested_secret("supabase", "url")).strip()
 SUPABASE_SECRET_KEY = (
     first_secret("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY", "supabase_secret_key")
     or nested_secret("supabase", "secret_key")
@@ -79,13 +71,10 @@ def get_db() -> Client:
 @st.cache_data(ttl=30, show_spinner=False)
 def load_menu() -> pd.DataFrame:
     response = (
-        get_db()
-        .table("menu")
+        get_db().table("menu")
         .select("id,dish,category,price,available")
         .eq("available", True)
-        .order("category")
-        .order("dish")
-        .execute()
+        .order("category").order("dish").execute()
     )
     df = pd.DataFrame(response.data or [])
     if df.empty:
@@ -95,43 +84,51 @@ def load_menu() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def load_managers() -> list[str]:
+def load_public_menu() -> pd.DataFrame:
     response = (
-        get_db()
-        .table("managers")
-        .select("name,active")
+        get_db().table("menu_options")
+        .select("id,menu_item_id,label,price,active,sort_order,menu!inner(id,dish,category,available)")
         .eq("active", True)
-        .order("name")
-        .execute()
+        .eq("menu.available", True)
+        .order("sort_order").execute()
     )
-    return [str(row["name"]) for row in (response.data or [])]
+    rows = []
+    for row in response.data or []:
+        menu = row.get("menu") or {}
+        rows.append({
+            "option_id": int(row["id"]),
+            "menu_item_id": int(row["menu_item_id"]),
+            "dish": str(menu.get("dish", "")),
+            "category": str(menu.get("category") or "Menu"),
+            "option": str(row.get("label") or "Standard"),
+            "price": float(row.get("price") or 0),
+            "sort_order": int(row.get("sort_order") or 0),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_managers() -> list[str]:
+    response = get_db().table("managers").select("name,active").eq("active", True).order("name").execute()
+    return [str(row["name"]) for row in response.data or []]
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def load_recent_orders(limit: int = 50) -> pd.DataFrame:
+def load_recent_orders(limit: int = 100) -> pd.DataFrame:
     response = (
-        get_db()
-        .table("orders")
-        .select(
-            "id,invoice_number,created_at,order_taker,customer,phone,total,payment_status,payment_method,payment_received_by,paid_at,order_status"
-        )
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
+        get_db().table("orders")
+        .select("id,invoice_number,created_at,order_source,order_taker,assigned_to,customer,phone,total,payment_status,payment_method,payment_received_by,paid_at,order_status")
+        .order("created_at", desc=True).limit(limit).execute()
     )
     return pd.DataFrame(response.data or [])
-
 
 
 def parse_quantity(text: str) -> tuple[float, str]:
     raw = (text or "").strip()
     if not raw:
         raise ValueError("Enter a quantity, for example 2, 1/2 tray, or 1 1/2 trays.")
-
     normalized = raw.lower().replace("trays", "tray").strip()
-    unit = "tray" if "tray" in normalized else ""
     number_text = normalized.replace("tray", "").strip()
-
     try:
         if " " in number_text and "/" in number_text:
             whole, frac = number_text.split(None, 1)
@@ -142,12 +139,10 @@ def parse_quantity(text: str) -> tuple[float, str]:
             value = float(number_text)
     except Exception as exc:
         raise ValueError("Use a quantity like 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays, or 1.5 trays.") from exc
-
     if value <= 0:
         raise ValueError("Quantity must be greater than zero.")
+    return round(value, 3), raw
 
-    label = raw
-    return round(value, 3), label
 
 def money(value: float) -> str:
     return f"{CURRENCY}{float(value):,.2f}"
@@ -168,585 +163,340 @@ def local_datetime(value: str | datetime) -> datetime:
 
 def build_invoice_pdf(order: dict) -> bytes:
     buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=LETTER,
-        rightMargin=0.6 * inch,
-        leftMargin=0.6 * inch,
-        topMargin=0.55 * inch,
-        bottomMargin=0.55 * inch,
-        title=f"Invoice {order['invoice_number']}",
-        author=BUSINESS_NAME,
-    )
-
+    doc = SimpleDocTemplate(buffer, pagesize=LETTER, rightMargin=.6*inch, leftMargin=.6*inch,
+                            topMargin=.55*inch, bottomMargin=.55*inch,
+                            title=f"Invoice {order['invoice_number']}", author=BUSINESS_NAME)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "InvoiceTitle",
-        parent=styles["Title"],
-        fontSize=18,
-        leading=22,
-        alignment=TA_CENTER,
-        spaceAfter=6,
-    )
-    right_style = ParagraphStyle(
-        "Right",
-        parent=styles["BodyText"],
-        alignment=TA_RIGHT,
-        fontSize=9,
-        leading=12,
-    )
+    title_style = ParagraphStyle("InvoiceTitle", parent=styles["Title"], fontSize=18, leading=22,
+                                 alignment=TA_CENTER, spaceAfter=6)
+    right_style = ParagraphStyle("Right", parent=styles["BodyText"], alignment=TA_RIGHT, fontSize=9, leading=12)
     small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, leading=12)
-
     story = [Paragraph(escape(BUSINESS_NAME), title_style)]
     contact = " | ".join(x for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
     if contact:
-        story.append(
-            Paragraph(escape(contact), ParagraphStyle("Contact", parent=small, alignment=TA_CENTER))
-        )
-    story.extend([Spacer(1, 0.18 * inch), Paragraph("INVOICE", styles["Heading2"])])
-
-    meta_left = [
-        f"<b>Invoice:</b> {escape(str(order['invoice_number']))}",
-        f"<b>Date:</b> {escape(str(order['date']))}",
-        f"<b>Taken by:</b> {escape(str(order.get('order_taker') or '-'))}",
-    ]
-    meta_right = [
-        f"<b>Customer:</b> {escape(str(order.get('customer') or '-'))}",
-        f"<b>Phone:</b> {escape(str(order.get('phone') or '-'))}",
-        f"<b>Address:</b> {escape(str(order.get('address') or '-'))}",
-    ]
-    meta = Table(
-        [[Paragraph("<br/>".join(meta_left), small), Paragraph("<br/>".join(meta_right), right_style)]],
-        colWidths=[3.6 * inch, 3.2 * inch],
-    )
-    meta.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
-    story.extend([meta, Spacer(1, 0.2 * inch)])
-
+        story.append(Paragraph(escape(contact), ParagraphStyle("Contact", parent=small, alignment=TA_CENTER)))
+    story += [Spacer(1, .18*inch), Paragraph("INVOICE", styles["Heading2"])]
+    left = [f"<b>Invoice:</b> {escape(str(order['invoice_number']))}",
+            f"<b>Date:</b> {escape(str(order['date']))}",
+            f"<b>Source:</b> {escape(str(order.get('order_source') or 'Staff'))}",
+            f"<b>Taken by:</b> {escape(str(order.get('order_taker') or '-'))}"]
+    right = [f"<b>Customer:</b> {escape(str(order.get('customer') or '-'))}",
+             f"<b>Phone:</b> {escape(str(order.get('phone') or '-'))}",
+             f"<b>Address:</b> {escape(str(order.get('address') or '-'))}"]
+    meta = Table([[Paragraph("<br/>".join(left), small), Paragraph("<br/>".join(right), right_style)]],
+                 colWidths=[3.6*inch, 3.2*inch])
+    meta.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP")]))
+    story += [meta, Spacer(1, .2*inch)]
     rows = [["Item", "Qty", "Unit Price", "Amount"]]
     for item in order["items"]:
-        rows.append(
-            [
-                escape(str(item["dish"])),
-                str(item.get("quantity_label") or item["qty"]),
-                money(item["price"]),
-                money(item["line_total"]),
-            ]
-        )
-
-    table = Table(rows, colWidths=[3.55 * inch, 0.6 * inch, 1.25 * inch, 1.4 * inch], repeatRows=1)
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-                ("ALIGN", (1, 0), (-1, 0), "RIGHT"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BBBBBB")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    story.extend([table, Spacer(1, 0.18 * inch)])
-
-    totals = [
-        ["Subtotal", money(order["subtotal"])],
-        ["Delivery", money(order["delivery_fee"])],
-        ["Discount", f"-{money(order['discount'])}"],
-        [f"Tax ({float(order['tax_percent']):.2f}%)", money(order["tax_amount"])],
-        ["TOTAL", money(order["total"])],
-    ]
-    total_table = Table(totals, colWidths=[5.4 * inch, 1.4 * inch], hAlign="RIGHT")
-    total_table.setStyle(
-        TableStyle(
-            [
-                ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]
-        )
-    )
-    story.append(total_table)
-
+        rows.append([escape(str(item["dish"])), str(item.get("quantity_label") or item["qty"]),
+                     money(item["price"]), money(item["line_total"])])
+    table = Table(rows, colWidths=[3.55*inch,.9*inch,1.05*inch,1.3*inch], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EEEEEE")), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("ALIGN", (1,0), (-1,-1), "RIGHT"), ("GRID", (0,0), (-1,-1), .5, colors.HexColor("#BBBBBB")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)
+    ]))
+    story += [table, Spacer(1,.18*inch)]
+    totals = [["Subtotal", money(order["subtotal"])], ["Delivery", money(order["delivery_fee"])],
+              ["Discount", f"-{money(order['discount'])}"],
+              [f"Tax ({float(order['tax_percent']):.2f}%)", money(order["tax_amount"])], ["TOTAL", money(order["total"])]]
+    tt = Table(totals, colWidths=[5.4*inch,1.4*inch], hAlign="RIGHT")
+    tt.setStyle(TableStyle([("ALIGN", (0,0), (-1,-1), "RIGHT"), ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"),
+                            ("LINEABOVE", (0,-1), (-1,-1), 1, colors.black), ("TOPPADDING", (0,0), (-1,-1), 4),
+                            ("BOTTOMPADDING", (0,0), (-1,-1), 4)]))
+    story.append(tt)
     if order.get("notes"):
-        story.extend(
-            [
-                Spacer(1, 0.2 * inch),
-                Paragraph("<b>Notes</b>", small),
-                Paragraph(escape(str(order["notes"])), small),
-            ]
-        )
-
-    story.extend(
-        [
-            Spacer(1, 0.28 * inch),
-            Paragraph(
-                "Thank you for your order!",
-                ParagraphStyle("Thanks", parent=small, alignment=TA_CENTER),
-            ),
-        ]
-    )
+        story += [Spacer(1,.2*inch), Paragraph("<b>Notes</b>", small), Paragraph(escape(str(order["notes"])), small)]
+    story += [Spacer(1,.28*inch), Paragraph("Thank you for your order!", ParagraphStyle("Thanks", parent=small, alignment=TA_CENTER))]
     doc.build(story)
-    buffer.seek(0)
     return buffer.getvalue()
 
 
 def fetch_order_for_pdf(order_id: int) -> dict:
     db = get_db()
-    order_resp = db.table("orders").select("*").eq("id", order_id).single().execute()
-    item_resp = (
-        db.table("order_items")
-        .select("dish,qty,quantity_label,unit_price,line_total")
-        .eq("order_id", order_id)
-        .order("id")
-        .execute()
-    )
-    row = order_resp.data
+    row = db.table("orders").select("*").eq("id", order_id).single().execute().data
+    items = db.table("order_items").select("dish,qty,quantity_label,unit_price,line_total").eq("order_id", order_id).order("id").execute().data or []
     created = local_datetime(row["created_at"])
     return {
-        "invoice_number": row["invoice_number"],
-        "date": created.strftime("%B %d, %Y %I:%M %p"),
-        "order_taker": row.get("order_taker"),
-        "customer": row.get("customer"),
-        "phone": row.get("phone"),
-        "address": row.get("address"),
-        "notes": row.get("notes"),
-        "items": [
-            {
-                "dish": item["dish"],
-                "qty": float(item["qty"]),
-                "quantity_label": item.get("quantity_label") or str(item["qty"]),
-                "price": float(item["unit_price"]),
-                "line_total": float(item["line_total"]),
-            }
-            for item in (item_resp.data or [])
-        ],
-        "subtotal": float(row["subtotal"]),
-        "delivery_fee": float(row["delivery_fee"]),
-        "discount": float(row["discount"]),
-        "tax_percent": float(row["tax_percent"]),
-        "tax_amount": float(row["tax_amount"]),
-        "total": float(row["total"]),
+        "invoice_number": row["invoice_number"], "date": created.strftime("%B %d, %Y %I:%M %p"),
+        "order_source": row.get("order_source"), "order_taker": row.get("order_taker"), "customer": row.get("customer"),
+        "phone": row.get("phone"), "address": row.get("address"), "notes": row.get("notes"),
+        "items": [{"dish": i["dish"], "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"]),
+                   "price": float(i["unit_price"]), "line_total": float(i["line_total"])} for i in items],
+        "subtotal": float(row["subtotal"]), "delivery_fee": float(row["delivery_fee"]), "discount": float(row["discount"]),
+        "tax_percent": float(row["tax_percent"]), "tax_amount": float(row["tax_amount"]), "total": float(row["total"]),
     }
 
 
-def create_order(
-    *,
-    order_taker: str,
-    customer: str,
-    phone: str,
-    address: str,
-    notes: str,
-    cart: list[dict],
-    delivery_fee: float,
-    discount: float,
-    tax_percent: float,
-) -> dict:
-    payload_items = [
-        {"menu_item_id": int(item["menu_item_id"]), "qty": float(item["qty"]), "quantity_label": item.get("quantity_label") or str(item["qty"])} for item in cart
-    ]
-    response = get_db().rpc(
-        "create_kitchen_order",
-        {
-            "p_order_taker": order_taker or None,
-            "p_customer": customer or None,
-            "p_phone": phone or None,
-            "p_address": address or None,
-            "p_notes": notes or None,
-            "p_items": payload_items,
-            "p_delivery_fee": float(delivery_fee),
-            "p_discount": float(discount),
-            "p_tax_percent": float(tax_percent),
-        },
-    ).execute()
-    if not response.data:
-        raise RuntimeError("Supabase did not return the newly created order.")
-    return response.data[0] if isinstance(response.data, list) else response.data
+def create_staff_order(order_taker, customer, phone, address, notes, cart, delivery_fee, discount, tax_percent):
+    payload = [{"menu_item_id": int(i["menu_item_id"]), "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"])} for i in cart]
+    r = get_db().rpc("create_kitchen_order", {"p_order_taker": order_taker or None, "p_customer": customer or None,
+        "p_phone": phone or None, "p_address": address or None, "p_notes": notes or None, "p_items": payload,
+        "p_delivery_fee": float(delivery_fee), "p_discount": float(discount), "p_tax_percent": float(tax_percent)}).execute()
+    if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
+    return r.data[0] if isinstance(r.data, list) else r.data
 
 
+def create_public_order(customer, phone, address, notes, cart):
+    payload = [{"menu_option_id": int(i["option_id"]), "qty": int(i["qty"])} for i in cart]
+    r = get_db().rpc("create_public_order", {"p_customer": customer, "p_phone": phone, "p_address": address or None,
+        "p_notes": notes or None, "p_items": payload}).execute()
+    if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
+    return r.data[0] if isinstance(r.data, list) else r.data
 
-def update_order_payment(order_id: int, payment_status: str, payment_method: str | None, received_by: str | None) -> dict:
-    response = get_db().rpc(
-        "update_order_payment",
-        {
-            "p_order_id": int(order_id),
-            "p_payment_status": payment_status,
-            "p_payment_method": payment_method,
-            "p_received_by": received_by,
-        },
-    ).execute()
-    if not response.data:
-        raise RuntimeError("Supabase did not return the updated payment record.")
-    return response.data[0] if isinstance(response.data, list) else response.data
 
-def require_password() -> None:
-    if not APP_PASSWORD:
-        return
-    if st.session_state.get("app_authenticated"):
-        return
+def update_order_payment(order_id, status, method, receiver):
+    r = get_db().rpc("update_order_payment", {"p_order_id": int(order_id), "p_payment_status": status,
+        "p_payment_method": method, "p_received_by": receiver}).execute()
+    return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
-    st.title("🍽️ Shukriya's Kitchen")
-    st.caption("Enter the shared app password to continue.")
-    entered = st.text_input("App password", type="password")
-    if st.button("Sign in", type="primary"):
-        if entered == APP_PASSWORD:
-            st.session_state.app_authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-    st.stop()
+
+def update_order_workflow(order_id, status, assigned_to):
+    r = get_db().rpc("update_order_workflow", {"p_order_id": int(order_id), "p_order_status": status,
+        "p_assigned_to": assigned_to}).execute()
+    return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    st.title("🍽️ Shukriya's Kitchen")
-    st.error("Supabase credentials are not being detected by this Streamlit app.")
-    st.write(
-        {
-            "Supabase URL detected": bool(SUPABASE_URL),
-            "Supabase secret key detected": bool(SUPABASE_SECRET_KEY),
-        }
-    )
-    st.markdown(
-        """In **Streamlit Community Cloud → Manage app → Settings → Secrets**, use this exact top-level format:
-
-```toml
-SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
-SUPABASE_SECRET_KEY = "sb_secret_YOUR_KEY"
-
-BUSINESS_NAME = "My Home Kitchen"
-CURRENCY = "$"
-APP_TIMEZONE = "America/Los_Angeles"
-APP_PASSWORD = "choose-a-password"
-```
-
-Save the secrets, then reboot the app. Do not put these credentials in GitHub."""
-    )
+    st.title(f"🍽️ {BUSINESS_NAME} Orders")
+    st.error("Supabase credentials are not configured.")
     st.stop()
-
-require_password()
-
-if "cart" not in st.session_state:
-    st.session_state.cart = []
-if "generated_invoice" not in st.session_state:
-    st.session_state.generated_invoice = None
-
-st.title("🍽️ Shukriya's Kitchen")
-st.caption("Shared menu, central order history, and PDF invoices powered by Supabase.")
 
 try:
     menu = load_menu()
+    public_menu = load_public_menu()
     managers = load_managers()
 except Exception as exc:
-    st.error(f"Could not connect to Supabase or load app data: {exc}")
+    st.title(f"🍽️ {BUSINESS_NAME}")
+    st.error(f"Could not connect to the ordering database: {exc}")
     st.stop()
 
-new_order_tab, history_tab, menu_tab = st.tabs(["New order", "Order history", "Menu"])
+for key, default in [("public_cart", []), ("staff_cart", []), ("public_confirmation", None), ("staff_invoice", None), ("manager_authenticated", False)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-with new_order_tab:
-    if menu.empty:
-        st.warning("No available menu items were found. Add items to the `menu` table in Supabase.")
+st.title(f"🍽️ {BUSINESS_NAME}")
+st.caption("Browse the menu and place an order online, or sign in to the manager area.")
+public_tab, manager_tab = st.tabs(["🍽️ Menu & Order", "🔐 Manager"])
+
+with public_tab:
+    st.subheader("Menu")
+    if public_menu.empty:
+        st.info("The online menu is not available yet.")
     else:
-        with st.expander("Customer & order details", expanded=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                order_taker = st.selectbox(
-                    "Order taken by",
-                    options=managers if managers else [""],
-                    key="order_taker",
-                )
-                customer = st.text_input("Customer name", key="customer")
-                phone = st.text_input("Phone", key="phone")
-            with c2:
-                address = st.text_area("Address", height=68, key="address")
-                notes = st.text_area("Order notes", height=68, key="notes")
-
-        st.subheader("Add dishes")
-
-        categories = sorted(
-            menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(),
-            key=str.casefold,
-        )
-        category_col, dish_col, qty_col = st.columns([2, 3, 1.4])
-
-        with category_col:
-            selected_category = st.selectbox(
-                "Category",
-                options=categories,
-                key="selected_category",
-            )
-
-        category_menu = menu[
-            menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu")
-            == selected_category
-        ].copy()
-
-        with dish_col:
-            selected_id = st.selectbox(
-                "Dish",
-                options=category_menu["id"].astype(int).tolist(),
-                format_func=lambda item_id: category_menu.loc[
-                    category_menu["id"] == item_id, "dish"
-                ].iloc[0],
-                key=f"dish_for_{selected_category}",
-            )
-
-        with qty_col:
-            qty_text = st.text_input(
-                "Quantity",
-                value="1",
-                help="Examples: 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays",
-                key="quantity_input",
-            )
-
-        selected = category_menu.loc[category_menu["id"] == selected_id].iloc[0]
-        st.caption(f"{money(float(selected['price']))} per base unit/tray")
-
-        if st.button("Add to order", type="primary", use_container_width=True):
-            try:
-                qty_value, qty_label = parse_quantity(qty_text)
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                st.session_state.cart.append(
-                    {
-                        "menu_item_id": int(selected_id),
-                        "dish": str(selected["dish"]),
-                        "qty": qty_value,
-                        "quantity_label": qty_label,
-                        "price": float(selected["price"]),
-                        "line_total": qty_value * float(selected["price"]),
-                    }
-                )
-                st.session_state.generated_invoice = None
+        categories = sorted(public_menu["category"].unique().tolist(), key=str.casefold)
+        category = st.selectbox("Category", categories, key="public_category")
+        cat_df = public_menu[public_menu["category"] == category].copy()
+        dishes = sorted(cat_df["dish"].unique().tolist(), key=str.casefold)
+        dish = st.selectbox("Dish", dishes, key="public_dish")
+        dish_df = cat_df[cat_df["dish"] == dish].sort_values(["sort_order", "price"])
+        option_ids = dish_df["option_id"].astype(int).tolist()
+        option_id = st.selectbox("Size / option", option_ids,
+            format_func=lambda oid: f"{dish_df.loc[dish_df['option_id']==oid, 'option'].iloc[0]} — {money(dish_df.loc[dish_df['option_id']==oid, 'price'].iloc[0])}",
+            key="public_option")
+        qcol, acol = st.columns([1,2])
+        with qcol:
+            qty = st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1, key="public_qty")
+        selected = dish_df.loc[dish_df["option_id"] == option_id].iloc[0]
+        with acol:
+            st.write("")
+            st.write("")
+            if st.button("Add to cart", type="primary", use_container_width=True):
+                st.session_state.public_cart.append({"option_id": int(option_id), "dish": dish,
+                    "option": str(selected["option"]), "qty": int(qty), "price": float(selected["price"]),
+                    "line_total": int(qty)*float(selected["price"])})
+                st.session_state.public_confirmation = None
                 st.rerun()
 
-        st.subheader("Current order")
-        if not st.session_state.cart:
-            st.info("No items added yet.")
+        st.markdown("### Your cart")
+        if not st.session_state.public_cart:
+            st.info("Your cart is empty.")
         else:
-            for idx, item in enumerate(st.session_state.cart):
-                cols = st.columns([4, 1, 2, 1])
-                cols[0].write(f"**{item['dish']}**")
-                cols[1].write(f"× {item.get('quantity_label') or item['qty']}")
-                cols[2].write(money(item["line_total"]))
-                if cols[3].button("✕", key=f"remove_{idx}"):
-                    st.session_state.cart.pop(idx)
-                    st.session_state.generated_invoice = None
-                    st.rerun()
-
-            displayed_subtotal = sum(i["line_total"] for i in st.session_state.cart)
-            a, b, c = st.columns(3)
-            with a:
-                delivery_fee = st.number_input(
-                    "Delivery fee", min_value=0.0, value=0.0, step=1.0, key="delivery_fee"
-                )
-            with b:
-                discount = st.number_input(
-                    "Discount", min_value=0.0, value=0.0, step=1.0, key="discount"
-                )
-            with c:
-                tax_percent = st.number_input(
-                    "Tax %", min_value=0.0, value=0.0, step=0.25, key="tax_percent"
-                )
-
-            displayed_taxable = max(0.0, displayed_subtotal + delivery_fee - discount)
-            displayed_tax = displayed_taxable * tax_percent / 100
-            displayed_total = displayed_taxable + displayed_tax
-
-            st.markdown(
-                f"**Subtotal:** {money(displayed_subtotal)}  \n"
-                f"**Delivery:** {money(delivery_fee)}  \n"
-                f"**Discount:** -{money(discount)}  \n"
-                f"**Tax:** {money(displayed_tax)}  \n"
-                f"### Estimated total: {money(displayed_total)}"
-            )
-            st.caption("Final prices are re-checked against Supabase when the order is submitted.")
-
-            g1, g2 = st.columns(2)
-            with g1:
-                if st.button("Clear order", use_container_width=True):
-                    st.session_state.cart = []
-                    st.session_state.generated_invoice = None
-                    st.rerun()
-            with g2:
-                if st.button("Save & generate invoice", type="primary", use_container_width=True):
+            for i, item in enumerate(st.session_state.public_cart):
+                c1,c2,c3,c4 = st.columns([3.5,1.2,1.4,.7])
+                c1.write(f"**{item['dish']}**  \n{item['option']}")
+                c2.write(f"× {item['qty']}")
+                c3.write(money(item["line_total"]))
+                if c4.button("✕", key=f"public_remove_{i}"):
+                    st.session_state.public_cart.pop(i); st.rerun()
+            subtotal = sum(i["line_total"] for i in st.session_state.public_cart)
+            st.markdown(f"### Total: {money(subtotal)}")
+            st.caption("Final price is verified against the live menu when you submit.")
+            st.markdown("### Your details")
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                customer = st.text_input("Name *", key="public_customer")
+                phone = st.text_input("Phone *", key="public_phone")
+            with pc2:
+                address = st.text_area("Address", height=70, key="public_address")
+                notes = st.text_area("Order notes", height=70, key="public_notes")
+            if st.button("Place order", type="primary", use_container_width=True):
+                if not customer.strip() or not phone.strip():
+                    st.error("Please enter your name and phone number.")
+                else:
                     try:
-                        created = create_order(
-                            order_taker=order_taker,
-                            customer=customer,
-                            phone=phone,
-                            address=address,
-                            notes=notes,
-                            cart=st.session_state.cart,
-                            delivery_fee=float(delivery_fee),
-                            discount=float(discount),
-                            tax_percent=float(tax_percent),
-                        )
+                        created = create_public_order(customer, phone, address, notes, st.session_state.public_cart)
                         order = fetch_order_for_pdf(int(created["order_id"]))
-                        st.session_state.generated_invoice = {
-                            "number": order["invoice_number"],
-                            "pdf": build_invoice_pdf(order),
-                        }
-                        st.session_state.cart = []
+                        st.session_state.public_confirmation = {"number": order["invoice_number"], "total": order["total"],
+                            "pdf": build_invoice_pdf(order)}
+                        st.session_state.public_cart = []
                         load_recent_orders.clear()
+                        st.rerun()
                     except Exception as exc:
-                        st.error(f"Could not save the order: {exc}")
+                        st.error(f"Could not place the order: {exc}")
 
-            if st.session_state.generated_invoice:
-                inv = st.session_state.generated_invoice
-                st.success(f"Invoice {inv['number']} saved and created.")
-                st.download_button(
-                    "Download PDF invoice",
-                    data=inv["pdf"],
-                    file_name=f"{inv['number']}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+        if st.session_state.public_confirmation:
+            conf = st.session_state.public_confirmation
+            st.success(f"Order {conf['number']} has been submitted. Total: {money(conf['total'])}")
+            st.info("The kitchen will contact you to confirm the order.")
+            st.download_button("Download order confirmation", data=conf["pdf"], file_name=f"{conf['number']}.pdf",
+                               mime="application/pdf", use_container_width=True)
 
-with history_tab:
-    h1, h2 = st.columns([3, 1])
-    with h1:
-        st.subheader("Recent orders")
-    with h2:
-        if st.button("Refresh", key="refresh_orders", use_container_width=True):
-            load_recent_orders.clear()
-            st.rerun()
-
-    try:
-        orders = load_recent_orders()
-    except Exception as exc:
-        st.error(f"Could not load order history: {exc}")
-        orders = pd.DataFrame()
-
-    if orders.empty:
-        st.info("No saved orders yet.")
+with manager_tab:
+    if not st.session_state.manager_authenticated and APP_PASSWORD:
+        st.subheader("Manager sign in")
+        entered = st.text_input("Manager password", type="password", key="manager_password_input")
+        if st.button("Sign in", type="primary", key="manager_signin"):
+            if entered == APP_PASSWORD:
+                st.session_state.manager_authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
     else:
-        display = orders.copy()
-        display["created_at"] = display["created_at"].map(
-            lambda x: local_datetime(x).strftime("%b %d, %Y %I:%M %p")
-        )
-        display["total"] = display["total"].map(money)
-        display = display.rename(
-            columns={
-                "invoice_number": "Invoice",
-                "created_at": "Date",
-                "order_taker": "Taken by",
-                "customer": "Customer",
-                "phone": "Phone",
-                "total": "Total",
-                "payment_status": "Payment",
-                "payment_method": "Method",
-                "payment_received_by": "Received by",
-                "order_status": "Status",
-            }
-        )
-        display["Method"] = display["Method"].fillna("-")
-        display["Received by"] = display["Received by"].fillna("-")
-        st.dataframe(
-            display[["Invoice", "Date", "Customer", "Total", "Payment", "Method", "Received by", "Status", "Taken by"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        if not APP_PASSWORD:
+            st.warning("APP_PASSWORD is empty, so the manager area is not protected.")
+        top1, top2 = st.columns([4,1])
+        top1.subheader("Manager dashboard")
+        if top2.button("Sign out", use_container_width=True):
+            st.session_state.manager_authenticated = False; st.rerun()
 
-        invoice_options = orders["invoice_number"].tolist()
-        chosen_invoice = st.selectbox("Select order", invoice_options)
-        chosen_row = orders.loc[orders["invoice_number"] == chosen_invoice].iloc[0]
+        staff_tab, history_tab, menu_tab = st.tabs(["Staff order", "Order history", "Menu"])
 
-        st.markdown("#### Update payment")
-        current_status = str(chosen_row.get("payment_status") or "Unpaid")
-        current_method = str(chosen_row.get("payment_method") or "Cash")
-        methods = ["Cash", "Zelle", "Card", "Venmo", "Other"]
-        if current_method not in methods:
-            methods.append(current_method)
+        with staff_tab:
+            if menu.empty:
+                st.warning("No available menu items.")
+            else:
+                c1,c2 = st.columns(2)
+                with c1:
+                    order_taker = st.selectbox("Order taken by", managers if managers else [""], key="staff_order_taker")
+                    customer = st.text_input("Customer name", key="staff_customer")
+                    phone = st.text_input("Phone", key="staff_phone")
+                with c2:
+                    address = st.text_area("Address", height=68, key="staff_address")
+                    notes = st.text_area("Order notes", height=68, key="staff_notes")
+                st.markdown("### Add dishes")
+                categories = sorted(menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(), key=str.casefold)
+                cc,dc,qc = st.columns([2,3,1.5])
+                with cc:
+                    category = st.selectbox("Category", categories, key="staff_category")
+                cat = menu[menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu") == category].copy()
+                with dc:
+                    item_id = st.selectbox("Dish", cat["id"].astype(int).tolist(),
+                        format_func=lambda iid: cat.loc[cat["id"]==iid, "dish"].iloc[0], key=f"staff_dish_{category}")
+                with qc:
+                    qty_text = st.text_input("Quantity", value="1", help="Examples: 2, 1/2 tray, 1 1/2 trays", key="staff_qty")
+                selected = cat.loc[cat["id"]==item_id].iloc[0]
+                st.caption(f"{money(float(selected['price']))} per base unit/tray")
+                if st.button("Add to staff order", type="primary", use_container_width=True):
+                    try:
+                        qv,ql = parse_quantity(qty_text)
+                        st.session_state.staff_cart.append({"menu_item_id": int(item_id), "dish": str(selected["dish"]),
+                            "qty": qv, "quantity_label": ql, "price": float(selected["price"]), "line_total": qv*float(selected["price"])})
+                        st.session_state.staff_invoice = None; st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+                if st.session_state.staff_cart:
+                    st.markdown("### Current order")
+                    for i,item in enumerate(st.session_state.staff_cart):
+                        a,b,c,d = st.columns([4,1.3,1.5,.7])
+                        a.write(f"**{item['dish']}**"); b.write(f"× {item['quantity_label']}"); c.write(money(item["line_total"]))
+                        if d.button("✕", key=f"staff_remove_{i}"):
+                            st.session_state.staff_cart.pop(i); st.rerun()
+                    sub = sum(i["line_total"] for i in st.session_state.staff_cart)
+                    a,b,c = st.columns(3)
+                    delivery = a.number_input("Delivery fee", min_value=0.0, value=0.0, step=1.0, key="staff_delivery")
+                    discount = b.number_input("Discount", min_value=0.0, value=0.0, step=1.0, key="staff_discount")
+                    tax = c.number_input("Tax %", min_value=0.0, value=0.0, step=.25, key="staff_tax")
+                    est = max(0, sub+delivery-discount) * (1+tax/100)
+                    st.markdown(f"### Estimated total: {money(est)}")
+                    if st.button("Save & generate invoice", type="primary", use_container_width=True):
+                        try:
+                            created = create_staff_order(order_taker, customer, phone, address, notes, st.session_state.staff_cart, delivery, discount, tax)
+                            order = fetch_order_for_pdf(int(created["order_id"]))
+                            st.session_state.staff_invoice = {"number": order["invoice_number"], "pdf": build_invoice_pdf(order)}
+                            st.session_state.staff_cart = []; load_recent_orders.clear(); st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not save order: {exc}")
+                if st.session_state.staff_invoice:
+                    inv = st.session_state.staff_invoice
+                    st.success(f"Invoice {inv['number']} saved.")
+                    st.download_button("Download PDF invoice", data=inv["pdf"], file_name=f"{inv['number']}.pdf", mime="application/pdf", use_container_width=True)
 
-        current_receiver = str(chosen_row.get("payment_received_by") or (managers[0] if managers else ""))
-        if current_receiver and current_receiver not in managers:
-            managers_for_payment = managers + [current_receiver]
-        else:
-            managers_for_payment = managers
-
-        pc1, pc2, pc3, pc4 = st.columns([1.2, 1.4, 1.5, 1])
-        with pc1:
-            payment_status = st.selectbox(
-                "Payment status",
-                ["Unpaid", "Paid"],
-                index=1 if current_status == "Paid" else 0,
-                key=f"payment_status_{chosen_row['id']}",
-            )
-        with pc2:
-            payment_method = st.selectbox(
-                "Payment method",
-                methods,
-                index=methods.index(current_method) if current_method in methods else 0,
-                disabled=payment_status != "Paid",
-                key=f"payment_method_{chosen_row['id']}",
-            )
-        with pc3:
-            payment_receiver = st.selectbox(
-                "Received by",
-                managers_for_payment if managers_for_payment else [""],
-                index=(managers_for_payment.index(current_receiver) if current_receiver in managers_for_payment else 0),
-                disabled=payment_status != "Paid",
-                key=f"payment_receiver_{chosen_row['id']}",
-            )
-        with pc4:
-            st.write("")
-            st.write("")
-            if st.button("Save payment", type="primary", use_container_width=True, key=f"save_payment_{chosen_row['id']}"):
+        with history_tab:
+            h1,h2 = st.columns([3,1]); h1.subheader("Recent orders")
+            if h2.button("Refresh", use_container_width=True): load_recent_orders.clear(); st.rerun()
+            orders = load_recent_orders()
+            if orders.empty:
+                st.info("No orders yet.")
+            else:
+                display = orders.copy()
+                display["created_at"] = display["created_at"].map(lambda x: local_datetime(x).strftime("%b %d, %Y %I:%M %p"))
+                display["total"] = display["total"].map(money)
+                display = display.rename(columns={"invoice_number":"Invoice","created_at":"Date","order_source":"Source","order_taker":"Taken by",
+                    "assigned_to":"Assigned to","customer":"Customer","total":"Total","payment_status":"Payment","payment_method":"Method",
+                    "payment_received_by":"Received by","order_status":"Status"})
+                for col in ["Taken by","Assigned to","Method","Received by"]: display[col] = display[col].fillna("-")
+                st.dataframe(display[["Invoice","Date","Source","Customer","Total","Status","Assigned to","Payment","Method","Received by","Taken by"]],
+                             use_container_width=True, hide_index=True)
+                chosen = st.selectbox("Select order", orders["invoice_number"].tolist(), key="history_order")
+                row = orders.loc[orders["invoice_number"]==chosen].iloc[0]
+                st.markdown("#### Order workflow")
+                statuses = ["New","Confirmed","Preparing","Ready","Delivered","Cancelled"]
+                current_status = str(row.get("order_status") or "New")
+                assigned = str(row.get("assigned_to") or "")
+                assign_opts = [""] + managers
+                if assigned and assigned not in assign_opts: assign_opts.append(assigned)
+                w1,w2,w3 = st.columns([1.5,1.5,1])
+                status = w1.selectbox("Order status", statuses, index=statuses.index(current_status) if current_status in statuses else 0, key=f"status_{row['id']}")
+                assignee = w2.selectbox("Assigned to", assign_opts, index=assign_opts.index(assigned) if assigned in assign_opts else 0, key=f"assign_{row['id']}")
+                w3.write(""); w3.write("")
+                if w3.button("Save status", type="primary", use_container_width=True, key=f"save_status_{row['id']}"):
+                    try:
+                        update_order_workflow(int(row["id"]), status, assignee or None); load_recent_orders.clear(); st.success("Order updated."); st.rerun()
+                    except Exception as exc: st.error(f"Could not update order: {exc}")
+                st.markdown("#### Payment")
+                methods = ["Cash","Zelle","Card","Venmo","Other"]
+                cur_p = str(row.get("payment_status") or "Unpaid"); cur_m = str(row.get("payment_method") or "Cash")
+                if cur_m not in methods: methods.append(cur_m)
+                cur_r = str(row.get("payment_received_by") or (managers[0] if managers else ""))
+                recv_opts = managers.copy()
+                if cur_r and cur_r not in recv_opts: recv_opts.append(cur_r)
+                p1,p2,p3,p4 = st.columns([1.2,1.4,1.4,1])
+                pstat = p1.selectbox("Payment status", ["Unpaid","Paid"], index=1 if cur_p=="Paid" else 0, key=f"pstat_{row['id']}")
+                pmethod = p2.selectbox("Payment method", methods, index=methods.index(cur_m), disabled=pstat!="Paid", key=f"pmethod_{row['id']}")
+                receiver = p3.selectbox("Received by", recv_opts if recv_opts else [""], index=recv_opts.index(cur_r) if cur_r in recv_opts else 0,
+                                        disabled=pstat!="Paid", key=f"receiver_{row['id']}")
+                p4.write(""); p4.write("")
+                if p4.button("Save payment", type="primary", use_container_width=True, key=f"savepay_{row['id']}"):
+                    try:
+                        update_order_payment(int(row["id"]), pstat, pmethod if pstat=="Paid" else None, receiver if pstat=="Paid" else None)
+                        load_recent_orders.clear(); st.success("Payment updated."); st.rerun()
+                    except Exception as exc: st.error(f"Could not update payment: {exc}")
                 try:
-                    update_order_payment(
-                        int(chosen_row["id"]),
-                        payment_status,
-                        payment_method if payment_status == "Paid" else None,
-                        payment_receiver if payment_status == "Paid" else None,
-                    )
-                    load_recent_orders.clear()
-                    st.success("Payment updated.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not update payment: {exc}")
+                    old = fetch_order_for_pdf(int(row["id"])); pdf = build_invoice_pdf(old)
+                    st.download_button("Download selected invoice", data=pdf, file_name=f"{chosen}.pdf", mime="application/pdf", use_container_width=True)
+                except Exception as exc: st.warning(f"Could not prepare invoice: {exc}")
 
-        paid_at = chosen_row.get("paid_at")
-        if current_status == "Paid" and paid_at:
-            st.caption(f"Paid {local_datetime(paid_at).strftime('%b %d, %Y %I:%M %p')}")
-
-        st.markdown("#### Invoice")
-        try:
-            old_order = fetch_order_for_pdf(int(chosen_row["id"]))
-            old_pdf = build_invoice_pdf(old_order)
-            st.download_button(
-                "Download selected invoice",
-                data=old_pdf,
-                file_name=f"{chosen_invoice}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        except Exception as exc:
-            st.warning(f"Could not prepare that invoice: {exc}")
-
-with menu_tab:
-    m1, m2 = st.columns([3, 1])
-    with m1:
-        st.subheader("Current menu")
-    with m2:
-        if st.button("Refresh menu", use_container_width=True):
-            load_menu.clear()
-            st.rerun()
-
-    if menu.empty:
-        st.info("No available menu items.")
-    else:
-        menu_display = menu[["dish", "category", "price"]].copy()
-        menu_display["price"] = menu_display["price"].map(money)
-        menu_display.columns = ["Dish", "Category", "Price"]
-        st.dataframe(menu_display, use_container_width=True, hide_index=True)
-    st.caption(
-        "For this version, add dishes or change prices/availability in Supabase → Table Editor → menu. "
-        "Changes appear here within about 30 seconds, or immediately after Refresh menu."
-    )
+        with menu_tab:
+            st.subheader("Public menu")
+            if public_menu.empty:
+                st.info("No public menu options.")
+            else:
+                md = public_menu[["category","dish","option","price"]].copy(); md["price"] = md["price"].map(money)
+                md.columns = ["Category","Dish","Option","Price"]
+                st.dataframe(md, use_container_width=True, hide_index=True)
+            st.caption("Edit dishes in Supabase → menu and customer-facing sizes/prices in Supabase → menu_options. Existing dishes have a Standard option automatically.")
 
 st.divider()
-st.caption("Supabase stores menu data, orders, and invoice line items centrally for all users.")
+st.caption(f"© {BUSINESS_NAME} · Online orders are submitted directly to the kitchen database.")

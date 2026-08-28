@@ -165,6 +165,73 @@ def load_managers() -> list[str]:
     return [str(row["name"]) for row in response.data or []]
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def load_active_announcements() -> list[dict]:
+    response = (
+        get_db().table("announcements")
+        .select("id,title,message,level,active,created_at,updated_at")
+        .eq("active", True)
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return list(response.data or [])
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_all_announcements() -> list[dict]:
+    response = (
+        get_db().table("announcements")
+        .select("id,title,message,level,active,created_at,updated_at")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return list(response.data or [])
+
+
+def create_announcement(title: str, message: str, level: str, active: bool = True) -> None:
+    get_db().table("announcements").insert({
+        "title": title.strip() or "Announcement",
+        "message": message.strip(),
+        "level": level,
+        "active": bool(active),
+    }).execute()
+    load_active_announcements.clear()
+    load_all_announcements.clear()
+
+
+def update_announcement(announcement_id: int, title: str, message: str, level: str, active: bool) -> None:
+    get_db().table("announcements").update({
+        "title": title.strip() or "Announcement",
+        "message": message.strip(),
+        "level": level,
+        "active": bool(active),
+    }).eq("id", int(announcement_id)).execute()
+    load_active_announcements.clear()
+    load_all_announcements.clear()
+
+
+def render_customer_announcements() -> None:
+    try:
+        announcements = load_active_announcements()
+    except Exception:
+        announcements = []
+    for ann in announcements:
+        title = str(ann.get("title") or "Announcement")
+        message = str(ann.get("message") or "").strip()
+        if not message:
+            continue
+        body = f"**{title}**\n\n{message}"
+        level = str(ann.get("level") or "Info")
+        if level == "Warning":
+            st.warning(body)
+        elif level == "Success":
+            st.success(body)
+        elif level == "Important":
+            st.error(body, icon="📣")
+        else:
+            st.info(body, icon="📣")
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def load_recent_orders(limit: int = 100) -> pd.DataFrame:
     response = (
@@ -444,6 +511,7 @@ st.caption("Browse the menu and place an order online, or sign in to the manager
 public_tab, manager_tab = st.tabs(["🍽️ Menu & Order", "🔐 Manager"])
 
 with public_tab:
+    render_customer_announcements()
     if public_menu.empty:
         st.info("The online menu is not available yet.")
     else:
@@ -659,7 +727,7 @@ with manager_tab:
             st.session_state.show_manager_notifications = False
             st.rerun()
 
-        staff_tab, history_tab, menu_tab = st.tabs(["Staff order", "Order history", "Menu"])
+        staff_tab, history_tab, menu_tab, announcement_tab = st.tabs(["Staff order", "Order history", "Menu", "Announcements"])
 
         with staff_tab:
             if menu.empty:
@@ -785,6 +853,69 @@ with manager_tab:
                 md.columns = ["Category","Dish","Option","Price"]
                 st.dataframe(md, use_container_width=True, hide_index=True)
             st.caption("Edit dishes in Supabase → menu and customer-facing sizes/prices in Supabase → menu_options. Existing dishes have a Standard option automatically.")
+
+        with announcement_tab:
+            st.subheader("Customer announcements")
+            st.caption("Active announcements appear at the top of the public Menu & Order page.")
+
+            with st.form("new_announcement_form", clear_on_submit=True):
+                a1, a2 = st.columns([2, 1])
+                with a1:
+                    new_title = st.text_input("Title", value="Announcement")
+                with a2:
+                    new_level = st.selectbox("Style", ["Info", "Important", "Warning", "Success"])
+                new_message = st.text_area("Message", placeholder="Example: We are accepting Eid catering orders through Friday.", height=100)
+                new_active = st.checkbox("Show to customers immediately", value=True)
+                publish = st.form_submit_button("Publish announcement", type="primary", use_container_width=True)
+                if publish:
+                    if not new_message.strip():
+                        st.error("Please enter an announcement message.")
+                    else:
+                        try:
+                            create_announcement(new_title, new_message, new_level, new_active)
+                            st.success("Announcement published.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not publish announcement: {exc}")
+
+            try:
+                existing_announcements = load_all_announcements()
+            except Exception as exc:
+                existing_announcements = []
+                st.error(f"Could not load announcements: {exc}")
+
+            if not existing_announcements:
+                st.info("No announcements yet.")
+            else:
+                st.markdown("#### Existing announcements")
+                for ann in existing_announcements:
+                    ann_id = int(ann["id"])
+                    updated = local_datetime(ann.get("updated_at") or ann.get("created_at")).strftime("%b %d, %Y %I:%M %p")
+                    status = "Active" if ann.get("active") else "Hidden"
+                    with st.expander(f"{ann.get('title') or 'Announcement'} · {status} · {updated}", expanded=False):
+                        title_key = f"ann_title_{ann_id}"
+                        msg_key = f"ann_message_{ann_id}"
+                        level_key = f"ann_level_{ann_id}"
+                        active_key = f"ann_active_{ann_id}"
+                        edit_title = st.text_input("Title", value=str(ann.get("title") or "Announcement"), key=title_key)
+                        levels = ["Info", "Important", "Warning", "Success"]
+                        current_level = str(ann.get("level") or "Info")
+                        if current_level not in levels:
+                            levels.append(current_level)
+                        edit_level = st.selectbox("Style", levels, index=levels.index(current_level), key=level_key)
+                        edit_message = st.text_area("Message", value=str(ann.get("message") or ""), height=100, key=msg_key)
+                        edit_active = st.checkbox("Visible to customers", value=bool(ann.get("active")), key=active_key)
+                        if st.button("Save announcement", key=f"save_ann_{ann_id}", use_container_width=True):
+                            if not edit_message.strip():
+                                st.error("Announcement message cannot be empty.")
+                            else:
+                                try:
+                                    update_announcement(ann_id, edit_title, edit_message, edit_level, edit_active)
+                                    st.success("Announcement updated.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Could not update announcement: {exc}")
+
 
 st.divider()
 st.caption(f"© {BUSINESS_NAME} · Online orders are submitted directly to the kitchen database.")

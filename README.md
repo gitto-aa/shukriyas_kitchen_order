@@ -1,23 +1,12 @@
-# Shukriya's Kitchen Orders — v15
+# Shukriya's Kitchen Orders v19
 
-This version keeps all v14 functionality and replaces the public customer cart with a compact table.
+Adds customer announcements to the v18 ordering system.
 
-## Customer cart
-The cart now shows one row per item with:
-- Item
-- Quantity
-- Unit price
-- Line total
-- Remove checkbox
+## New in v19
+- Manager `Announcements` tab.
+- Publish an announcement with title, message, style, and active/hidden status.
+- Styles: Info, Important, Warning, Success.
+- Edit or hide previous announcements.
+- Active announcements appear at the top of the public Menu & Order page.
 
-Customers can mark one or more rows and press **Remove selected**.
-
-No Supabase/database migration is required for v15.
-
-
-## v18 manager notifications
-- Manager dashboard now polls for new online orders every 5 seconds while it is open.
-- A bell shows a red dot and pending count when `Online` orders are still in `New` status.
-- Clicking the bell shows a compact list of pending online orders.
-- The alert automatically clears as managers move orders from `New` to `Confirmed`, `Preparing`, etc.
-- This is an in-app alert; it is not an iOS/Android push notification when the browser/app is closed.
+The Supabase `announcements` table is required. If this package came from the configured project session, that migration has already been applied.

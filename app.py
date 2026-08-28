@@ -459,10 +459,31 @@ def local_datetime(value: str | datetime) -> datetime:
         return dt
 
 
+def payment_details_for_invoice(order: dict) -> dict:
+    status = str(order.get("payment_status") or "").strip() or "Unpaid"
+    method = str(order.get("payment_method") or "").strip()
+    receiver = str(order.get("payment_received_by") or "").strip()
+    paid_at_raw = order.get("paid_at")
+    paid_at = ""
+    if paid_at_raw:
+        try:
+            paid_at = local_datetime(str(paid_at_raw)).strftime("%b %d, %Y %I:%M %p")
+        except Exception:
+            paid_at = str(paid_at_raw)
+    return {
+        "status": status,
+        "is_paid": status.casefold() == "paid",
+        "method": method,
+        "receiver": receiver,
+        "paid_at": paid_at,
+    }
+
+
 def build_invoice_pdf(order: dict) -> bytes:
     """Create a compact, invoice-style PDF with minimal unused page space."""
     buffer = BytesIO()
     styles = getSampleStyleSheet()
+    payment = payment_details_for_invoice(order)
 
     # A5-like width is easy to read on phones and prints neatly.  The height is
     # calculated from the rendered content below, so a short order does not
@@ -652,6 +673,28 @@ def build_invoice_pdf(order: dict) -> bytes:
     totals_table.setStyle(TableStyle(totals_style))
     story.append(totals_table)
 
+    if payment["is_paid"]:
+        payment_lines = ["<b>PAYMENT STATUS:</b> PAID"]
+        if payment["method"]:
+            payment_lines.append(f"<b>Method:</b> {escape(payment['method'])}")
+        if payment["receiver"]:
+            payment_lines.append(f"<b>Received by:</b> {escape(payment['receiver'])}")
+        if payment["paid_at"]:
+            payment_lines.append(f"<b>Paid at:</b> {escape(payment['paid_at'])}")
+        payment_table = Table(
+            [[Paragraph("<br/>".join(payment_lines), small)]],
+            colWidths=[usable_width],
+            style=TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F5FAF5")),
+                ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#3F7A4D")),
+                ("LEFTPADDING", (0,0), (-1,-1), 6),
+                ("RIGHTPADDING", (0,0), (-1,-1), 6),
+                ("TOPPADDING", (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ]),
+        )
+        story.extend([Spacer(1, 5), payment_table])
+
     if order.get("notes"):
         story.extend([
             Spacer(1, 5),
@@ -692,13 +735,45 @@ def build_invoice_pdf(order: dict) -> bytes:
         title=f"Invoice {order['invoice_number']}",
         author=BUSINESS_NAME,
     )
-    doc.build(story)
+
+    def draw_paid_watermark(canv, _doc):
+        if not payment["is_paid"]:
+            return
+        canv.saveState()
+        try:
+            canv.setFillAlpha(0.08)
+            canv.setStrokeAlpha(0.2)
+        except Exception:
+            pass
+        stamp_color = colors.HexColor("#1F3554")
+        canv.setStrokeColor(stamp_color)
+        canv.setFillColor(stamp_color)
+        canv.setLineWidth(2)
+        cx = page_width / 2
+        cy = page_height / 2
+        canv.translate(cx, cy)
+        canv.rotate(18)
+        outer_w = min(3.45 * inch, page_width - 0.55 * inch)
+        outer_h = 1.95 * inch
+        inner_w = outer_w - 0.22 * inch
+        inner_h = outer_h - 0.22 * inch
+        canv.ellipse(-outer_w/2, -outer_h/2, outer_w/2, outer_h/2, stroke=1, fill=0)
+        canv.ellipse(-inner_w/2, -inner_h/2, inner_w/2, inner_h/2, stroke=1, fill=0)
+        canv.setFont("Helvetica-Bold", 28)
+        canv.drawCentredString(0, -5, "PAID")
+        canv.setFont("Helvetica-Bold", 11)
+        canv.drawCentredString(0, outer_h/2 - 18, "THANK YOU")
+        canv.drawCentredString(0, -outer_h/2 + 10, "THANK YOU")
+        canv.restoreState()
+
+    doc.build(story, onFirstPage=draw_paid_watermark, onLaterPages=draw_paid_watermark)
     return buffer.getvalue()
 
 
 
 def build_invoice_print_html(order: dict) -> str:
     """Build a compact, print-friendly HTML invoice for direct browser printing."""
+    payment = payment_details_for_invoice(order)
     items_html = "".join(
         f"""
         <tr>
@@ -759,6 +834,17 @@ def build_invoice_print_html(order: dict) -> str:
     notes_html = ""
     if order.get("notes"):
         notes_html = f'<div class="notes"><strong>Notes:</strong> {escape(str(order["notes"]))}</div>'
+    payment_html = ""
+    if payment["is_paid"]:
+        payment_bits = ['<div><span><strong>Payment status</strong></span><span><strong>PAID</strong></span></div>']
+        if payment["method"]:
+            payment_bits.append(f'<div><span>Method</span><span>{escape(payment["method"])}</span></div>')
+        if payment["receiver"]:
+            payment_bits.append(f'<div><span>Received by</span><span>{escape(payment["receiver"])}</span></div>')
+        if payment["paid_at"]:
+            payment_bits.append(f'<div><span>Paid at</span><span>{escape(payment["paid_at"])}</span></div>')
+        payment_html = f'<div class="payment-box">{"".join(payment_bits)}</div>'
+    watermark_html = '<div class="watermark" aria-hidden="true"><div class="stamp"><div class="thank top">THANK YOU</div><div class="paid">PAID</div><div class="thank bottom">THANK YOU</div></div></div>' if payment["is_paid"] else ""
 
     return f"""<!doctype html>
 <html>
@@ -773,7 +859,15 @@ def build_invoice_print_html(order: dict) -> str:
     color: #111; background: #fff; margin: 0; padding: 0;
     font-size: 11px; line-height: 1.35;
   }}
-  .invoice {{ width: 135mm; max-width: 100%; margin: 0 auto; }}
+  .invoice {{ width: 135mm; max-width: 100%; margin: 0 auto; position: relative; }}
+  .watermark {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; z-index:0; }}
+  .stamp {{ width:92mm; height:52mm; border:3px solid rgba(31,53,84,.24); border-radius:999px; transform:rotate(-18deg); display:flex; align-items:center; justify-content:center; position:relative; color:rgba(31,53,84,.24); }}
+  .stamp::after {{ content:''; position:absolute; inset:5mm; border:2px solid rgba(31,53,84,.20); border-radius:999px; }}
+  .stamp .paid {{ font-size:24px; font-weight:800; letter-spacing:.08em; position:relative; z-index:1; }}
+  .stamp .thank {{ position:absolute; font-size:11px; font-weight:700; letter-spacing:.2em; }}
+  .stamp .top {{ top:7px; }}
+  .stamp .bottom {{ bottom:7px; }}
+  .header, .divider, .details, .delivery, table, .totals, .payment-box, .notes, .footer {{ position: relative; z-index: 1; }}
   .header {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }}
   .business {{ font-size:18px; font-weight:700; }}
   .muted {{ color:#666; font-size:10px; }}
@@ -791,6 +885,8 @@ def build_invoice_print_html(order: dict) -> str:
   .totals {{ width:48%; margin:8px 0 0 auto; }}
   .totals div {{ display:flex; justify-content:space-between; padding:2px 0; }}
   .totals .grand {{ border-top:1px solid #777; margin-top:3px; padding-top:5px; font-size:14px; font-weight:700; }}
+  .payment-box {{ margin:8px 0 0 auto; width:56%; border:1px solid #3f7a4d; background:#f5faf5; padding:6px 8px; font-size:10px; }}
+  .payment-box div {{ display:flex; justify-content:space-between; gap:10px; padding:1px 0; }}
   .notes {{ margin-top:8px; font-size:10px; }}
   .footer {{ margin-top:9px; text-align:center; color:#666; font-size:9px; }}
   @media print {{
@@ -800,6 +896,7 @@ def build_invoice_print_html(order: dict) -> str:
 </head>
 <body>
   <div class="invoice">
+    {watermark_html}
     <div class="header">
       <div>
         <div class="business">{escape(BUSINESS_NAME)}</div>
@@ -826,6 +923,7 @@ def build_invoice_print_html(order: dict) -> str:
       {adjustments}
       <div class="grand"><span>Total</span><span>{escape(money(order['total']))}</span></div>
     </div>
+    {payment_html}
     {notes_html}
     <div class="footer">Thank you for your order.</div>
   </div>
@@ -888,6 +986,8 @@ def fetch_order_for_pdf(order_id: int) -> dict:
         "order_source": row.get("order_source"), "order_taker": row.get("order_taker"), "customer": row.get("customer"),
         "customer_code": row.get("customer_code"), "phone": row.get("phone"), "address": row.get("address"), "notes": row.get("notes"),
         "delivery_date": row.get("delivery_date"), "delivery_time": row.get("delivery_time"),
+        "payment_status": row.get("payment_status"), "payment_method": row.get("payment_method"),
+        "payment_received_by": row.get("payment_received_by"), "paid_at": row.get("paid_at"),
         "items": [{"dish": i["dish"], "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"]),
                    "price": float(i["unit_price"]), "line_total": float(i["line_total"])} for i in items],
         "subtotal": float(row["subtotal"]), "delivery_fee": float(row["delivery_fee"]), "discount": float(row["discount"]),

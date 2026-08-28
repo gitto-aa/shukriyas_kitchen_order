@@ -1332,17 +1332,57 @@ with manager_tab:
                     st.warning("This dish has no active selling format. Update it in the Menu tab.")
                     option_id = None; qv = 0.0; ql = ""; unit_price = 0.0
                 else:
-                    if len(ids) > 1:
-                        option_id = st.selectbox("How is it sold?", ids, format_func=lambda oid: f"{item_options.loc[item_options['option_id']==oid,'option'].iloc[0]} — {money(item_options.loc[item_options['option_id']==oid,'price'].iloc[0])}", key=f"staff_option_{item_id}")
-                    else:
-                        option_id = ids[0]
-                    option_row = item_options.loc[item_options["option_id"]==option_id].iloc[0]
+                    # Keep selling format and quantity as two separate controls.
+                    # Always show the option dropdown, even when only one format is available,
+                    # so the manager workflow stays consistent from dish to dish.
+                    option_id = st.selectbox(
+                        "Option",
+                        ids,
+                        format_func=lambda oid: f"{item_options.loc[item_options['option_id']==oid,'option'].iloc[0]} — {money(item_options.loc[item_options['option_id']==oid,'price'].iloc[0])}",
+                        key=f"staff_option_{item_id}",
+                    )
+                    option_row = item_options.loc[item_options["option_id"] == option_id].iloc[0]
                     option_label = str(option_row["option"]).strip()
-                    unit_price = float(option_row["price"]); minq = float(option_row.get("min_order_qty") or 1)
+                    unit_price = float(option_row["price"])
+                    minq = float(option_row.get("min_order_qty") or 1)
+                    minimum_qty = max(1, int(round(minq))) if option_label.casefold() == "piece" else 1
+
+                    qty_key = f"staff_add_qty_{item_id}_{option_id}"
+                    if qty_key not in st.session_state:
+                        st.session_state[qty_key] = minimum_qty
+                    # If a menu minimum was raised after this state was created, respect the new minimum.
+                    st.session_state[qty_key] = max(minimum_qty, int(st.session_state[qty_key]))
+
+                    st.markdown("**Quantity**")
+                    minus_col, qty_col, plus_col = st.columns([1, 1.35, 1])
+                    if minus_col.button(
+                        "−",
+                        key=f"staff_add_minus_{item_id}_{option_id}",
+                        disabled=int(st.session_state[qty_key]) <= minimum_qty,
+                        use_container_width=True,
+                    ):
+                        st.session_state[qty_key] = max(minimum_qty, int(st.session_state[qty_key]) - 1)
+                        st.rerun()
+                    qv = float(int(st.session_state[qty_key]))
+                    qty_col.markdown(
+                        f"<div style='text-align:center;padding:.55rem .1rem;font-size:1.05rem;font-weight:700'>{int(qv)}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if plus_col.button(
+                        "+",
+                        key=f"staff_add_plus_{item_id}_{option_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[qty_key] = min(100, int(st.session_state[qty_key]) + 1)
+                        st.rerun()
+
                     if option_label.casefold() == "piece":
-                        min_piece=max(1,int(round(minq))); qv=float(st.number_input("Quantity", min_value=min_piece, max_value=100, value=min_piece, step=1, key=f"staff_piece_qty_{item_id}")); ql=f"{int(qv)} piece" if int(qv)==1 else f"{int(qv)} pieces"; st.caption(f"Minimum order: {min_piece} piece{'s' if min_piece != 1 else ''} · {money(unit_price)} each")
+                        ql = f"{int(qv)} piece" if int(qv) == 1 else f"{int(qv)} pieces"
+                        st.caption(f"Minimum order: {minimum_qty} piece{'s' if minimum_qty != 1 else ''} · {money(unit_price)} each")
                     else:
-                        qv=1.0; ql=option_label; st.caption(f"Selected: {option_label} · {money(unit_price)}")
+                        ql = option_label if int(qv) == 1 else f"{int(qv)} × {option_label}"
+                        st.caption(f"{option_label} · {money(unit_price)} each")
+
                 if st.button("Add to staff order", type="primary", use_container_width=True, disabled=option_id is None):
                     st.session_state.staff_cart.append({"menu_item_id": int(item_id), "option_id": int(option_id) if option_id is not None else None, "dish": str(selected["dish"]),
                         "qty": qv, "quantity_label": ql, "price": unit_price, "line_total": qv*unit_price})

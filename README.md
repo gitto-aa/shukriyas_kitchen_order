@@ -1,1 +1,1 @@
-v33 makes the staff-order quantity field directly editable while retaining minus/plus buttons and minimum quantity enforcement.
+v34: category dropdowns in add/edit dish and Supabase menu save ambiguity fix.

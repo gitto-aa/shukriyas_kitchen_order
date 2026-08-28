@@ -1671,11 +1671,15 @@ with manager_tab:
                 all_menu = pd.DataFrame(columns=["id","dish","category","price","available"])
                 st.error(f"Could not load menu items: {exc}")
 
+            category_options = sorted({str(x).strip() for x in all_menu.get("category", pd.Series(dtype=str)).dropna().tolist() if str(x).strip()})
+            if not category_options:
+                category_options = ["Bangla items", "Chinese", "Dessert", "Frozen"]
+
             with st.expander("➕ Add new dish", expanded=all_menu.empty):
                 with st.form("add_menu_item_form", clear_on_submit=True):
                     a1, a2 = st.columns([2, 1.3])
                     new_dish = a1.text_input("Dish name")
-                    new_category = a2.text_input("Category", placeholder="Bangla items, Chinese, Dessert...")
+                    new_category = a2.selectbox("Category", category_options, key="new_menu_category")
                     new_formats = st.multiselect("How is it sold?", STANDARD_FORMATS, placeholder="Select one or more")
                     new_units = []
                     if new_formats:
@@ -1729,7 +1733,17 @@ with manager_tab:
                 with st.form(f"edit_menu_item_{selected_id}"):
                     e1, e2 = st.columns([2, 1.3])
                     edit_dish = e1.text_input("Dish name", value=str(selected_row["dish"]))
-                    edit_category = e2.text_input("Category", value=str(selected_row["category"] or ""))
+                    current_category = str(selected_row["category"] or "").strip()
+                    edit_category_options = category_options.copy()
+                    if current_category and current_category not in edit_category_options:
+                        edit_category_options.append(current_category)
+                        edit_category_options = sorted(edit_category_options)
+                    edit_category = e2.selectbox(
+                        "Category",
+                        edit_category_options,
+                        index=edit_category_options.index(current_category) if current_category in edit_category_options else 0,
+                        key=f"edit_menu_category_{selected_id}",
+                    )
                     edit_formats = st.multiselect("How is it sold?", STANDARD_FORMATS, default=selected_standard)
                     if custom_active:
                         st.caption("Existing special formats preserved: " + ", ".join(f"{o['label']} ({money(o['price'])})" for o in custom_active))

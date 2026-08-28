@@ -18,7 +18,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from supabase import Client, create_client
 
 
-st.set_page_config(page_title="Home Kitchen Orders", page_icon="🍽️", layout="centered")
+st.set_page_config(page_title="Shukriya's Kitchen", page_icon="🍽️", layout="centered")
 
 
 def setting(name: str, default: str = "") -> str:
@@ -388,7 +388,7 @@ def require_password() -> None:
     if st.session_state.get("app_authenticated"):
         return
 
-    st.title("🍽️ Home Kitchen Orders")
+    st.title("🍽️ Shukriya's Kitchen")
     st.caption("Enter the shared app password to continue.")
     entered = st.text_input("App password", type="password")
     if st.button("Sign in", type="primary"):
@@ -401,7 +401,7 @@ def require_password() -> None:
 
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    st.title("🍽️ Home Kitchen Orders")
+    st.title("🍽️ Shukriya's Kitchen")
     st.error("Supabase credentials are not being detected by this Streamlit app.")
     st.write(
         {
@@ -433,7 +433,7 @@ if "cart" not in st.session_state:
 if "generated_invoice" not in st.session_state:
     st.session_state.generated_invoice = None
 
-st.title("🍽️ Home Kitchen Orders")
+st.title("🍽️ Shukriya's Kitchen")
 st.caption("Shared menu, central order history, and PDF invoices powered by Supabase.")
 
 try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from fractions import Fraction
+import re
 from html import escape
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -107,6 +109,33 @@ def load_recent_orders(limit: int = 50) -> pd.DataFrame:
     return pd.DataFrame(response.data or [])
 
 
+
+def parse_quantity(text: str) -> tuple[float, str]:
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("Enter a quantity, for example 2, 1/2 tray, or 1 1/2 trays.")
+
+    normalized = raw.lower().replace("trays", "tray").strip()
+    unit = "tray" if "tray" in normalized else ""
+    number_text = normalized.replace("tray", "").strip()
+
+    try:
+        if " " in number_text and "/" in number_text:
+            whole, frac = number_text.split(None, 1)
+            value = float(whole) + float(Fraction(frac))
+        elif "/" in number_text:
+            value = float(Fraction(number_text))
+        else:
+            value = float(number_text)
+    except Exception as exc:
+        raise ValueError("Use a quantity like 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays, or 1.5 trays.") from exc
+
+    if value <= 0:
+        raise ValueError("Quantity must be greater than zero.")
+
+    label = raw
+    return round(value, 3), label
+
 def money(value: float) -> str:
     return f"{CURRENCY}{float(value):,.2f}"
 
@@ -185,7 +214,7 @@ def build_invoice_pdf(order: dict) -> bytes:
         rows.append(
             [
                 escape(str(item["dish"])),
-                str(item["qty"]),
+                str(item.get("quantity_label") or item["qty"]),
                 money(item["price"]),
                 money(item["line_total"]),
             ]
@@ -257,7 +286,7 @@ def fetch_order_for_pdf(order_id: int) -> dict:
     order_resp = db.table("orders").select("*").eq("id", order_id).single().execute()
     item_resp = (
         db.table("order_items")
-        .select("dish,qty,unit_price,line_total")
+        .select("dish,qty,quantity_label,unit_price,line_total")
         .eq("order_id", order_id)
         .order("id")
         .execute()
@@ -275,7 +304,8 @@ def fetch_order_for_pdf(order_id: int) -> dict:
         "items": [
             {
                 "dish": item["dish"],
-                "qty": int(item["qty"]),
+                "qty": float(item["qty"]),
+                "quantity_label": item.get("quantity_label") or str(item["qty"]),
                 "price": float(item["unit_price"]),
                 "line_total": float(item["line_total"]),
             }
@@ -303,7 +333,7 @@ def create_order(
     tax_percent: float,
 ) -> dict:
     payload_items = [
-        {"menu_item_id": int(item["menu_item_id"]), "qty": int(item["qty"])} for item in cart
+        {"menu_item_id": int(item["menu_item_id"]), "qty": float(item["qty"]), "quantity_label": item.get("quantity_label") or str(item["qty"])} for item in cart
     ]
     response = get_db().rpc(
         "create_kitchen_order",
@@ -409,30 +439,29 @@ with new_order_tab:
                 format_func=lambda item_id: menu.loc[menu["id"] == item_id, "dish"].iloc[0],
             )
         with right:
-            qty = st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1)
+            qty_text = st.text_input("Quantity", value="1", help="Examples: 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays")
 
         selected = menu.loc[menu["id"] == selected_id].iloc[0]
-        st.caption(f"{selected['category']} · {money(float(selected['price']))} each")
+        st.caption(f"{selected['category']} · {money(float(selected['price']))} per base unit/tray")
 
         if st.button("Add to order", type="primary", use_container_width=True):
-            existing = next(
-                (i for i in st.session_state.cart if i["menu_item_id"] == int(selected_id)), None
-            )
-            if existing:
-                existing["qty"] += int(qty)
-                existing["line_total"] = existing["qty"] * existing["price"]
+            try:
+                qty_value, qty_label = parse_quantity(qty_text)
+            except ValueError as exc:
+                st.error(str(exc))
             else:
                 st.session_state.cart.append(
                     {
                         "menu_item_id": int(selected_id),
                         "dish": str(selected["dish"]),
-                        "qty": int(qty),
+                        "qty": qty_value,
+                        "quantity_label": qty_label,
                         "price": float(selected["price"]),
-                        "line_total": int(qty) * float(selected["price"]),
+                        "line_total": qty_value * float(selected["price"]),
                     }
                 )
-            st.session_state.generated_invoice = None
-            st.rerun()
+                st.session_state.generated_invoice = None
+                st.rerun()
 
         st.subheader("Current order")
         if not st.session_state.cart:
@@ -441,7 +470,7 @@ with new_order_tab:
             for idx, item in enumerate(st.session_state.cart):
                 cols = st.columns([4, 1, 2, 1])
                 cols[0].write(f"**{item['dish']}**")
-                cols[1].write(f"× {item['qty']}")
+                cols[1].write(f"× {item.get('quantity_label') or item['qty']}")
                 cols[2].write(money(item["line_total"]))
                 if cols[3].button("✕", key=f"remove_{idx}"):
                     st.session_state.cart.pop(idx)

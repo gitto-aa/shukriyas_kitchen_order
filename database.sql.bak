@@ -38,8 +38,7 @@ create table if not exists public.order_items (
     order_id bigint not null references public.orders(id) on delete cascade,
     menu_item_id bigint references public.menu(id) on delete set null,
     dish text not null,
-    qty numeric(10,3) not null check (qty > 0),
-    quantity_label text,
+    qty integer not null check (qty > 0),
     unit_price numeric(10,2) not null check (unit_price >= 0),
     line_total numeric(12,2) not null check (line_total >= 0)
 );
@@ -93,8 +92,7 @@ declare
     v_created_at timestamptz;
     v_item jsonb;
     v_menu_id bigint;
-    v_qty numeric(10,3);
-    v_qty_label text;
+    v_qty integer;
     v_dish text;
     v_price numeric(10,2);
     v_subtotal numeric(12,2) := 0;
@@ -126,8 +124,7 @@ begin
     for v_item in select value from jsonb_array_elements(p_items)
     loop
         v_menu_id := nullif(v_item->>'menu_item_id', '')::bigint;
-        v_qty := coalesce(nullif(v_item->>'qty', '')::numeric, 0);
-        v_qty_label := nullif(trim(coalesce(v_item->>'quantity_label', '')), '');
+        v_qty := coalesce(nullif(v_item->>'qty', '')::integer, 0);
 
         if v_menu_id is null or v_qty <= 0 then
             raise exception 'Invalid menu item or quantity';
@@ -143,9 +140,9 @@ begin
         end if;
 
         insert into public.order_items (
-            order_id, menu_item_id, dish, qty, quantity_label, unit_price, line_total
+            order_id, menu_item_id, dish, qty, unit_price, line_total
         ) values (
-            v_order_id, v_menu_id, v_dish, v_qty, coalesce(v_qty_label, v_qty::text), v_price, round(v_price * v_qty, 2)
+            v_order_id, v_menu_id, v_dish, v_qty, v_price, round(v_price * v_qty, 2)
         );
 
         v_subtotal := v_subtotal + round(v_price * v_qty, 2);

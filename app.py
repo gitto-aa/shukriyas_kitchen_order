@@ -126,14 +126,15 @@ def get_db() -> Client:
 def load_menu() -> pd.DataFrame:
     response = (
         get_db().table("menu")
-        .select("id,dish,category,price,available")
+        .select("id,dish,category,price,available,sale_mode,min_order_qty")
         .eq("available", True)
         .order("category").order("dish").execute()
     )
     df = pd.DataFrame(response.data or [])
     if df.empty:
-        return pd.DataFrame(columns=["id", "dish", "category", "price", "available"])
+        return pd.DataFrame(columns=["id", "dish", "category", "price", "available", "sale_mode", "min_order_qty"])
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["min_order_qty"] = pd.to_numeric(df.get("min_order_qty", 1), errors="coerce").fillna(1)
     return df.dropna(subset=["price"]).reset_index(drop=True)
 
 
@@ -141,7 +142,7 @@ def load_menu() -> pd.DataFrame:
 def load_public_menu() -> pd.DataFrame:
     response = (
         get_db().table("menu_options")
-        .select("id,menu_item_id,label,price,active,sort_order,menu!inner(id,dish,category,available)")
+        .select("id,menu_item_id,label,price,active,sort_order,menu!inner(id,dish,category,available,sale_mode,min_order_qty)")
         .eq("active", True)
         .eq("menu.available", True)
         .order("sort_order").execute()
@@ -157,8 +158,46 @@ def load_public_menu() -> pd.DataFrame:
             "option": str(row.get("label") or "Standard"),
             "price": float(row.get("price") or 0),
             "sort_order": int(row.get("sort_order") or 0),
+            "sale_mode": str(menu.get("sale_mode") or "piece"),
+            "min_order_qty": float(menu.get("min_order_qty") or 1),
         })
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_all_menu_items() -> pd.DataFrame:
+    response = (
+        get_db().table("menu")
+        .select("id,dish,category,price,available,sale_mode,min_order_qty")
+        .order("category").order("dish").execute()
+    )
+    df = pd.DataFrame(response.data or [])
+    if df.empty:
+        return pd.DataFrame(columns=["id", "dish", "category", "price", "available", "sale_mode", "min_order_qty"])
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["min_order_qty"] = pd.to_numeric(df.get("min_order_qty", 1), errors="coerce").fillna(1)
+    return df.reset_index(drop=True)
+
+
+def save_menu_item(menu_item_id: int | None, dish: str, category: str, price: float, available: bool,
+                   sale_mode: str = "piece", min_order_qty: float = 1.0,
+                   box_price: float | None = None, half_tray_price: float | None = None) -> None:
+    payload = {
+        "p_menu_item_id": int(menu_item_id) if menu_item_id is not None else None,
+        "p_dish": dish, "p_category": category, "p_price": float(price),
+        "p_available": bool(available), "p_sale_mode": sale_mode,
+        "p_min_order_qty": float(min_order_qty),
+        "p_box_price": float(box_price) if box_price is not None else None,
+        "p_half_tray_price": float(half_tray_price) if half_tray_price is not None else None,
+    }
+    get_db().rpc("admin_save_menu_item_v2", payload).execute()
+    load_menu.clear(); load_public_menu.clear(); load_all_menu_items.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_menu_option_prices(menu_item_id: int) -> dict[str, float]:
+    r = get_db().table("menu_options").select("label,price,active").eq("menu_item_id", int(menu_item_id)).execute()
+    return {str(x["label"]): float(x["price"]) for x in (r.data or []) if bool(x.get("active", True))}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -183,6 +222,59 @@ def kitchen_address() -> str:
         return load_store_settings().get("kitchen_address", "").strip() or BUSINESS_ADDRESS
     except Exception:
         return BUSINESS_ADDRESS
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_customers() -> pd.DataFrame:
+    response = get_db().table("customers").select("id,name,normalized_name,short_code,phone").order("name").execute()
+    df = pd.DataFrame(response.data or [])
+    if df.empty:
+        return pd.DataFrame(columns=["id","name","normalized_name","short_code","phone"])
+    return df
+
+
+def normalize_customer_name(name: str) -> str:
+    return " ".join((name or "").strip().split()).casefold()
+
+
+def existing_customer_record(name: str) -> dict:
+    norm = normalize_customer_name(name)
+    if not norm:
+        return {}
+    try:
+        df = load_customers()
+        match = df[df["normalized_name"].astype(str).str.casefold() == norm]
+        return match.iloc[0].to_dict() if not match.empty else {}
+    except Exception:
+        return {}
+
+
+def existing_customer_code(name: str) -> str:
+    row = existing_customer_record(name)
+    return str(row.get("short_code") or "")
+
+
+def existing_customer_phone(name: str) -> str:
+    row = existing_customer_record(name)
+    return str(row.get("phone") or "")
+
+
+def autofill_customer_contact(name_key: str, phone_key: str) -> None:
+    name = str(st.session_state.get(name_key, "") or "")
+    row = existing_customer_record(name)
+    if row:
+        st.session_state[phone_key] = str(row.get("phone") or "")
+
+
+def resolve_customer_code(name: str, phone: str = "") -> str:
+    clean = " ".join((name or "").strip().split())
+    if not clean:
+        return ""
+    result = get_db().rpc("resolve_customer_code", {"p_name": clean, "p_phone": phone or None}).execute()
+    row = (result.data or [{}])[0] if isinstance(result.data, list) else (result.data or {})
+    code = str(row.get("resolved_short_code") or "")
+    load_customers.clear()
+    return code
 
 
 def delivery_date_options(days: int = 120) -> list[date]:
@@ -789,25 +881,28 @@ def fetch_order_for_pdf(order_id: int) -> dict:
     }
 
 
-def create_staff_order(order_taker, customer, customer_code, phone, address, notes, delivery_date, delivery_time, cart, delivery_fee, discount, tax_percent):
-    payload = [{"menu_item_id": int(i["menu_item_id"]), "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"])} for i in cart]
+def create_staff_order(order_taker, customer, phone, address, notes, delivery_date, delivery_time, cart, delivery_fee, discount, tax_percent):
+    payload = [{"menu_item_id": int(i["menu_item_id"]), "menu_option_id": int(i["option_id"]) if i.get("option_id") is not None else None, "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"])} for i in cart]
     r = get_db().rpc("create_kitchen_order", {"p_order_taker": order_taker or None, "p_customer": customer or None,
         "p_phone": phone or None, "p_address": address or None, "p_notes": notes or None, "p_items": payload,
         "p_delivery_fee": float(delivery_fee), "p_discount": float(discount), "p_tax_percent": float(tax_percent)}).execute()
     if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
     created = r.data[0] if isinstance(r.data, list) else r.data
+    code = resolve_customer_code(customer, phone) if (customer or "").strip() else ""
     get_db().table("orders").update({
-        "customer_code": customer_code.strip() or None,
+        "customer_code": code or None,
         "delivery_date": delivery_date.isoformat() if delivery_date else None,
         "delivery_time": delivery_time.strftime("%H:%M:%S") if delivery_time else None,
     }).eq("id", int(created["order_id"])).execute()
     return created
 
 
-def update_order_details(order_id: int, customer: str, customer_code: str, delivery_date_value: date | None, delivery_time_value: time | None) -> None:
+def update_order_details(order_id: int, customer: str, phone: str, delivery_date_value: date | None, delivery_time_value: time | None) -> None:
+    code = resolve_customer_code(customer, phone) if (customer or "").strip() else ""
     get_db().table("orders").update({
         "customer": customer.strip() or None,
-        "customer_code": customer_code.strip() or None,
+        "phone": phone.strip() or None,
+        "customer_code": code or None,
         "delivery_date": delivery_date_value.isoformat() if delivery_date_value else None,
         "delivery_time": delivery_time_value.strftime("%H:%M:%S") if delivery_time_value else None,
     }).eq("id", int(order_id)).execute()
@@ -826,7 +921,10 @@ def create_public_order(customer, phone, address, notes, cart):
     r = get_db().rpc("create_public_order", {"p_customer": customer, "p_phone": phone, "p_address": address or None,
         "p_notes": notes or None, "p_items": payload}).execute()
     if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
-    return r.data[0] if isinstance(r.data, list) else r.data
+    created = r.data[0] if isinstance(r.data, list) else r.data
+    code = resolve_customer_code(customer, phone) if (customer or "").strip() else ""
+    get_db().table("orders").update({"customer_code": code or None}).eq("id", int(created["order_id"])).execute()
+    return created
 
 
 def update_order_payment(order_id, status, method, receiver):
@@ -842,20 +940,27 @@ def update_order_workflow(order_id, status):
 
 
 def cart_item_is_tray(item: dict) -> bool:
-    return str(item.get("category") or "").strip().casefold() in {"main", "side"}
+    return str(item.get("sale_mode") or "").strip().casefold() == "tray"
+
+def cart_item_is_package(item: dict) -> bool:
+    return str(item.get("sale_mode") or "").strip().casefold() == "package"
 
 
 def cart_quantity_label(item: dict, qty: float) -> str:
     if cart_item_is_tray(item):
         qtxt = f"{qty:g}"
         return f"{qtxt} tray" if abs(qty - 1.0) < 1e-9 else f"{qtxt} trays"
+    if cart_item_is_package(item):
+        label = str(item.get("option") or "package")
+        return label if abs(qty - 1.0) < 1e-9 else f"{qty:g} × {label}"
     return str(int(round(qty)))
 
 
 def adjust_public_cart_item(index: int, delta: float) -> None:
     item = st.session_state.public_cart[index]
     is_tray = cart_item_is_tray(item)
-    minimum = 0.5 if is_tray else 1.0
+    is_package = cart_item_is_package(item)
+    minimum = 0.5 if is_tray else (1.0 if is_package else float(item.get("min_order_qty", 1) or 1))
     current = float(item.get("qty", minimum))
     new_qty = max(minimum, current + delta)
     item["qty"] = new_qty
@@ -964,10 +1069,10 @@ with public_tab:
                         label = str(menu_option["option"]).strip()
                         price_text = money(float(menu_option["price"]))
                         if label.casefold() == "standard":
-                            if str(menu_category).strip().casefold() in {"main", "side"}:
-                                option_parts.append(f"{escape(price_text)} / tray")
-                            else:
-                                option_parts.append(escape(price_text))
+                            mode = str(menu_option.get("sale_mode") or "piece").casefold()
+                            if mode == "tray": option_parts.append(f"{escape(price_text)} / tray")
+                            elif mode == "piece": option_parts.append(f"{escape(price_text)} / piece")
+                            else: option_parts.append(escape(price_text))
                         else:
                             option_parts.append(f"{escape(label)}: {escape(price_text)}")
                     compact_rows.append(
@@ -985,36 +1090,38 @@ with public_tab:
         dishes = sorted(cat_df["dish"].unique().tolist(), key=str.casefold)
         dish = st.selectbox("Dish", dishes, key="public_dish")
         dish_df = cat_df[cat_df["dish"] == dish].sort_values(["sort_order", "price"])
+        sale_mode = str(dish_df.iloc[0].get("sale_mode") or "piece").casefold()
+        min_order_qty = float(dish_df.iloc[0].get("min_order_qty") or 1)
         option_ids = dish_df["option_id"].astype(int).tolist()
-        option_id = st.selectbox("Size / option", option_ids,
-            format_func=lambda oid: f"{dish_df.loc[dish_df['option_id']==oid, 'option'].iloc[0]} — {money(dish_df.loc[dish_df['option_id']==oid, 'price'].iloc[0])}",
-            key="public_option")
-        qcol, acol = st.columns([1,2])
+        if sale_mode == "package":
+            option_id = st.selectbox("Package", option_ids,
+                format_func=lambda oid: f"{dish_df.loc[dish_df['option_id']==oid, 'option'].iloc[0]} — {money(dish_df.loc[dish_df['option_id']==oid, 'price'].iloc[0])}",
+                key="public_option")
+        else:
+            option_id = option_ids[0]
+        qcol, acol = st.columns([1.2,2])
         selected = dish_df.loc[dish_df["option_id"] == option_id].iloc[0]
         with qcol:
-            if str(category).strip().casefold() in {"main", "side"}:
-                qty = float(st.number_input(
-                    "Tray quantity",
-                    min_value=0.5,
-                    max_value=20.0,
-                    value=1.0,
-                    step=0.5,
-                    format="%.1f",
-                    key="public_tray_qty",
-                    help="Enter the number of trays, for example 0.5, 1, 1.5, or 2.",
-                ))
-                qty_text = f"{qty:g}"
-                quantity_label = f"{qty_text} tray" if abs(qty - 1.0) < 1e-9 else f"{qty_text} trays"
-                st.caption(f"Enter trays as a number (for example 0.5 or 1.5). Price per tray: {money(float(selected['price']))}")
+            if sale_mode == "tray":
+                qty = float(st.number_input("Tray quantity", min_value=0.5, max_value=20.0, value=max(1.0,min_order_qty), step=0.5, format="%.1f", key="public_tray_qty"))
+                qty_text = f"{qty:g}"; quantity_label = f"{qty_text} tray" if abs(qty-1)<1e-9 else f"{qty_text} trays"
+                st.caption(f"Price: {money(float(selected['price']))} / tray")
+            elif sale_mode == "package":
+                qty = 1.0
+                quantity_label = str(selected["option"])
+                st.caption("Choose Box or Half Tray above.")
             else:
-                qty = float(st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1, key="public_qty"))
+                min_piece = max(1, int(round(min_order_qty)))
+                qty = float(st.number_input("Quantity", min_value=min_piece, max_value=100, value=min_piece, step=1, key="public_qty"))
                 quantity_label = str(int(qty))
+                st.caption(f"Minimum order: {min_piece} piece{'s' if min_piece != 1 else ''}")
         with acol:
             st.write("")
             st.write("")
             if st.button("Add to cart", type="primary", use_container_width=True):
                 st.session_state.public_cart.append({"option_id": int(option_id), "dish": dish,
-                    "category": str(category), "option": str(selected["option"]), "qty": float(qty),
+                    "category": str(category), "option": str(selected["option"]), "sale_mode": sale_mode,
+                    "min_order_qty": min_order_qty, "qty": float(qty),
                     "quantity_label": quantity_label, "price": float(selected["price"]),
                     "line_total": float(qty) * float(selected["price"])})
                 st.session_state.public_confirmation = None
@@ -1036,8 +1143,9 @@ with public_tab:
                 for idx, item in enumerate(st.session_state.public_cart):
                     item_name = public_cart_item_name(item)
                     is_tray = cart_item_is_tray(item)
+                    is_package = cart_item_is_package(item)
                     step = 0.5 if is_tray else 1.0
-                    minimum = 0.5 if is_tray else 1.0
+                    minimum = 0.5 if is_tray else (1.0 if is_package else float(item.get("min_order_qty", 1) or 1))
                     qty_value = float(item.get("qty", minimum))
 
                     row = st.columns([3.4, 2.6, 1.5, 1.5, 0.7], vertical_alignment="center")
@@ -1072,11 +1180,12 @@ with public_tab:
                 for idx, item in enumerate(st.session_state.public_cart):
                     item_name = public_cart_item_name(item)
                     is_tray = cart_item_is_tray(item)
+                    is_package = cart_item_is_package(item)
                     step = 0.5 if is_tray else 1.0
-                    minimum = 0.5 if is_tray else 1.0
+                    minimum = 0.5 if is_tray else (1.0 if is_package else float(item.get("min_order_qty", 1) or 1))
                     qty_value = float(item.get("qty", minimum))
                     display_qty = str(item.get("quantity_label") or cart_quantity_label(item, qty_value))
-                    unit_note = "per tray" if is_tray else "each"
+                    unit_note = "per tray" if is_tray else (str(item.get("option") or "package") if is_package else "each")
 
                     top_left, top_right = st.columns([3.2, 1.2], vertical_alignment="center")
                     top_left.markdown(f"**{escape(item_name)}**")
@@ -1170,38 +1279,64 @@ with manager_tab:
                 c1,c2 = st.columns(2)
                 with c1:
                     order_taker = st.selectbox("Order taken by", managers if managers else [""], key="staff_order_taker")
-                    customer = st.text_input("Customer name", key="staff_customer")
-                    customer_code = st.text_input("Customer code / short name", placeholder="e.g. ADIB, RUMEE-1", key="staff_customer_code")
+                    customer = st.text_input(
+                        "Customer name",
+                        key="staff_customer",
+                        on_change=autofill_customer_contact,
+                        args=("staff_customer", "staff_phone"),
+                    )
+                    known_customer = existing_customer_record(customer)
+                    known_code = str(known_customer.get("short_code") or "") if known_customer else ""
+                    if customer.strip():
+                        if known_customer:
+                            saved_phone = str(known_customer.get("phone") or "").strip()
+                            detail = f"Customer code: **{known_code}**"
+                            if saved_phone:
+                                detail += f" · Saved contact: **{saved_phone}**"
+                            st.caption(detail)
+                        else:
+                            st.caption("Customer code will be generated automatically and the contact number will be saved when this order is saved.")
                     phone = st.text_input("Phone", key="staff_phone")
                 with c2:
                     address = st.text_area("Customer address", height=68, key="staff_address")
                     notes = st.text_area("Order notes", height=68, key="staff_notes")
                 d1, d2 = st.columns(2)
-                date_options = delivery_date_options()
+                today_local = datetime.now(ZoneInfo(APP_TIMEZONE)).date()
                 time_options = delivery_time_options()
-                delivery_date_value = d1.selectbox("Delivery date", date_options, format_func=format_delivery_date, key="staff_delivery_date")
+                delivery_date_value = d1.date_input(
+                    "Delivery date",
+                    value=today_local,
+                    min_value=today_local,
+                    max_value=today_local + timedelta(days=365),
+                    format="MM/DD/YYYY",
+                    key="staff_delivery_date",
+                )
                 delivery_time_value = d2.selectbox("Delivery time", time_options, format_func=format_delivery_time, key="staff_delivery_time")
                 st.markdown("### Add dishes")
                 categories = sorted(menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(), key=str.casefold)
-                cc,dc,qc = st.columns([2,3,1.5])
-                with cc:
-                    category = st.selectbox("Category", categories, key="staff_category")
+                cc,dc = st.columns([2,3])
+                with cc: category = st.selectbox("Category", categories, key="staff_category")
                 cat = menu[menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu") == category].copy()
                 with dc:
                     item_id = st.selectbox("Dish", cat["id"].astype(int).tolist(),
                         format_func=lambda iid: cat.loc[cat["id"]==iid, "dish"].iloc[0], key=f"staff_dish_{category}")
-                with qc:
-                    qty_text = st.text_input("Quantity", value="1", help="Examples: 2, 1/2 tray, 1 1/2 trays", key="staff_qty")
                 selected = cat.loc[cat["id"]==item_id].iloc[0]
-                st.caption(f"{money(float(selected['price']))} per base unit/tray")
+                mode = str(selected.get("sale_mode") or "piece").casefold(); minq = float(selected.get("min_order_qty") or 1)
+                option_id = None
+                if mode == "package":
+                    package_options = public_menu[public_menu["menu_item_id"] == int(item_id)].copy()
+                    ids = package_options["option_id"].astype(int).tolist()
+                    option_id = st.selectbox("Package", ids, format_func=lambda oid: f"{package_options.loc[package_options['option_id']==oid,'option'].iloc[0]} — {money(package_options.loc[package_options['option_id']==oid,'price'].iloc[0])}", key=f"staff_package_{item_id}")
+                    option_row = package_options.loc[package_options["option_id"]==option_id].iloc[0]
+                    qv=1.0; ql=str(option_row["option"]); unit_price=float(option_row["price"]); st.caption("Sold as Box or Half Tray.")
+                elif mode == "tray":
+                    qv=float(st.number_input("Tray quantity", min_value=0.5, max_value=20.0, value=max(1.0,minq), step=0.5, key=f"staff_tray_qty_{item_id}")); ql=f"{qv:g} tray" if abs(qv-1)<1e-9 else f"{qv:g} trays"; unit_price=float(selected["price"]); st.caption(f"Price: {money(unit_price)} / tray")
+                else:
+                    min_piece=max(1,int(round(minq))); qv=float(st.number_input("Quantity", min_value=min_piece, max_value=100, value=min_piece, step=1, key=f"staff_piece_qty_{item_id}")); ql=str(int(qv)); unit_price=float(selected["price"]); st.caption(f"Minimum order: {min_piece} piece{'s' if min_piece != 1 else ''} · {money(unit_price)} each")
                 if st.button("Add to staff order", type="primary", use_container_width=True):
-                    try:
-                        qv,ql = parse_quantity(qty_text)
-                        st.session_state.staff_cart.append({"menu_item_id": int(item_id), "dish": str(selected["dish"]),
-                            "qty": qv, "quantity_label": ql, "price": float(selected["price"]), "line_total": qv*float(selected["price"])})
-                        st.session_state.staff_invoice = None; st.rerun()
-                    except ValueError as exc:
-                        st.error(str(exc))
+                    st.session_state.staff_cart.append({"menu_item_id": int(item_id), "option_id": int(option_id) if option_id is not None else None, "dish": str(selected["dish"]),
+                        "qty": qv, "quantity_label": ql, "price": unit_price, "line_total": qv*unit_price})
+                    st.session_state.staff_invoice = None; st.rerun()
                 if st.session_state.staff_cart:
                     st.markdown("### Current order")
                     for i,item in enumerate(st.session_state.staff_cart):
@@ -1218,7 +1353,7 @@ with manager_tab:
                     st.markdown(f"### Estimated total: {money(est)}")
                     if st.button("Save & generate invoice", type="primary", use_container_width=True):
                         try:
-                            created = create_staff_order(order_taker, customer, customer_code, phone, address, notes, delivery_date_value, delivery_time_value, st.session_state.staff_cart, delivery, discount, tax)
+                            created = create_staff_order(order_taker, customer, phone, address, notes, delivery_date_value, delivery_time_value, st.session_state.staff_cart, delivery, discount, tax)
                             order = fetch_order_for_pdf(int(created["order_id"]))
                             st.session_state.staff_invoice = {"number": order["invoice_number"], "pdf": build_invoice_pdf(order), "order": order}
                             st.session_state.staff_cart = []; load_recent_orders.clear(); st.rerun()
@@ -1275,17 +1410,32 @@ with manager_tab:
                 row = orders.loc[orders["invoice_number"]==chosen].iloc[0]
                 st.markdown("#### Customer & delivery")
                 e1,e2,e3,e4,e5 = st.columns([1.7,1.2,1.4,1.3,1])
-                edit_customer = e1.text_input("Customer", value=str(row.get("customer") or ""), key=f"edit_customer_{row['id']}")
-                edit_code = e2.text_input("Short code", value=str(row.get("customer_code") or ""), key=f"edit_code_{row['id']}")
-                date_opts = delivery_date_options()
-                current_dd = None
+                edit_customer_key = f"edit_customer_{row['id']}"
+                edit_phone_key = f"edit_phone_{row['id']}"
+                edit_customer = e1.text_input(
+                    "Customer",
+                    value=str(row.get("customer") or ""),
+                    key=edit_customer_key,
+                    on_change=autofill_customer_contact,
+                    args=(edit_customer_key, edit_phone_key),
+                )
+                edit_phone = e2.text_input("Phone", value=str(row.get("phone") or ""), key=edit_phone_key)
+                auto_code = existing_customer_code(edit_customer) or str(row.get("customer_code") or "")
+                if auto_code:
+                    e2.caption(f"Code: **{auto_code}**")
+                today_local = datetime.now(ZoneInfo(APP_TIMEZONE)).date()
                 try:
-                    current_dd = date.fromisoformat(str(row.get("delivery_date"))) if row.get("delivery_date") else date_opts[0]
+                    current_dd = date.fromisoformat(str(row.get("delivery_date"))) if row.get("delivery_date") else today_local
                 except Exception:
-                    current_dd = date_opts[0]
-                if current_dd not in date_opts:
-                    date_opts = [current_dd] + date_opts
-                edit_dd = e3.selectbox("Delivery date", date_opts, index=date_opts.index(current_dd), format_func=format_delivery_date, key=f"edit_dd_{row['id']}")
+                    current_dd = today_local
+                edit_dd = e3.date_input(
+                    "Delivery date",
+                    value=current_dd,
+                    min_value=min(current_dd, today_local - timedelta(days=365)),
+                    max_value=max(current_dd, today_local + timedelta(days=365)),
+                    format="MM/DD/YYYY",
+                    key=f"edit_dd_{row['id']}",
+                )
                 time_opts = delivery_time_options()
                 try:
                     raw_time = str(row.get("delivery_time") or "")[:5]
@@ -1298,7 +1448,7 @@ with manager_tab:
                 e5.write(""); e5.write("")
                 if e5.button("Save details", type="primary", use_container_width=True, key=f"save_details_{row['id']}"):
                     try:
-                        update_order_details(int(row["id"]), edit_customer, edit_code, edit_dd, edit_dt)
+                        update_order_details(int(row["id"]), edit_customer, edit_phone, edit_dd, edit_dt)
                         st.success("Customer and delivery details updated."); st.rerun()
                     except Exception as exc:
                         st.error(f"Could not update details: {exc}")
@@ -1350,14 +1500,85 @@ with manager_tab:
                 except Exception as exc: st.warning(f"Could not prepare invoice: {exc}")
 
         with menu_tab:
-            st.subheader("Public menu")
-            if public_menu.empty:
-                st.info("No public menu options.")
+            st.subheader("Menu management")
+            st.caption("Add dishes, change category or price, and show/hide items without opening Supabase.")
+
+            try:
+                all_menu = load_all_menu_items()
+            except Exception as exc:
+                all_menu = pd.DataFrame(columns=["id","dish","category","price","available"])
+                st.error(f"Could not load menu items: {exc}")
+
+            with st.expander("➕ Add new dish", expanded=all_menu.empty):
+                with st.form("add_menu_item_form", clear_on_submit=True):
+                    a1, a2 = st.columns([2, 1.3])
+                    new_dish = a1.text_input("Dish name")
+                    existing_categories = sorted(
+                        [str(x) for x in all_menu.get("category", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()],
+                        key=str.casefold,
+                    )
+                    new_category = a2.text_input("Category", placeholder="Main, Side, Snacks, Dessert...")
+                    new_mode_label = st.selectbox("How is it sold?", ["Piece", "Tray", "Box / Half Tray"]); new_mode={"Piece":"piece","Tray":"tray","Box / Half Tray":"package"}[new_mode_label]
+                    new_min=1.0; new_box=None; new_half=None
+                    if new_mode == "piece":
+                        c1,c2=st.columns(2); new_price=c1.number_input("Price per piece",min_value=0.0,value=0.0,step=.5,format="%.2f"); new_min=c2.number_input("Minimum order (pieces)",min_value=1,value=1,step=1)
+                    elif new_mode == "tray":
+                        c1,c2=st.columns(2); new_price=c1.number_input("Price per tray",min_value=0.0,value=0.0,step=.5,format="%.2f"); new_min=c2.number_input("Minimum trays",min_value=.5,value=.5,step=.5)
+                    else:
+                        c1,c2=st.columns(2); new_box=c1.number_input("Box price",min_value=0.0,value=0.0,step=.5,format="%.2f"); new_half=c2.number_input("Half Tray price",min_value=0.0,value=0.0,step=.5,format="%.2f"); new_price=new_box
+                    new_available = st.checkbox("Available to customers", value=True)
+                    add_item = st.form_submit_button("Add dish", type="primary", use_container_width=True)
+                    if add_item:
+                        try:
+                            save_menu_item(None, new_dish, new_category, new_price, new_available, new_mode, new_min, new_box, new_half)
+                            st.success("Dish added.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not add dish: {exc}")
+
+            if all_menu.empty:
+                st.info("No menu items yet.")
             else:
-                md = public_menu[["category","dish","option","price"]].copy(); md["price"] = md["price"].map(money)
-                md.columns = ["Category","Dish","Option","Price"]
-                st.dataframe(md, use_container_width=True, hide_index=True)
-            st.caption("Edit dishes in Supabase → menu and customer-facing sizes/prices in Supabase → menu_options. Existing dishes have a Standard option automatically.")
+                display_menu = all_menu.copy()
+                display_menu["Price"] = display_menu["price"].map(money)
+                display_menu["Available"] = display_menu["available"].map(lambda x: "Yes" if bool(x) else "No")
+                display_menu["Selling"] = display_menu["sale_mode"].map({"piece":"Piece","tray":"Tray","package":"Box / Half Tray"}).fillna(display_menu["sale_mode"])
+                display_menu["Minimum"] = display_menu.apply(lambda r: f"{int(r['min_order_qty'])} pcs" if r['sale_mode']=='piece' else (f"{r['min_order_qty']:g} tray" if r['sale_mode']=='tray' else "1 package"), axis=1)
+                display_menu = display_menu.rename(columns={"category":"Category","dish":"Dish"})
+                st.dataframe(display_menu[["Category","Dish","Selling","Minimum","Price","Available"]], use_container_width=True, hide_index=True)
+
+                st.markdown("#### Edit a dish")
+                selected_id = st.selectbox(
+                    "Select dish",
+                    all_menu["id"].astype(int).tolist(),
+                    format_func=lambda iid: f"{all_menu.loc[all_menu['id']==iid, 'category'].iloc[0]} · {all_menu.loc[all_menu['id']==iid, 'dish'].iloc[0]}",
+                    key="menu_editor_selected_id",
+                )
+                selected_row = all_menu.loc[all_menu["id"] == selected_id].iloc[0]
+                with st.form(f"edit_menu_item_{selected_id}"):
+                    e1, e2 = st.columns([2, 1.3])
+                    edit_dish = e1.text_input("Dish name", value=str(selected_row["dish"]))
+                    edit_category = e2.text_input("Category", value=str(selected_row["category"] or ""))
+                    current_mode=str(selected_row.get("sale_mode") or "piece"); mode_labels={"piece":"Piece","tray":"Tray","package":"Box / Half Tray"}; edit_mode_label=st.selectbox("How is it sold?",list(mode_labels.values()),index=list(mode_labels.keys()).index(current_mode) if current_mode in mode_labels else 0); edit_mode={v:k for k,v in mode_labels.items()}[edit_mode_label]
+                    edit_min=float(selected_row.get("min_order_qty") or 1); edit_box=None; edit_half=None
+                    existing_opts=load_menu_option_prices(int(selected_id))
+                    if edit_mode == "piece":
+                        f1,f2=st.columns(2); edit_price=f1.number_input("Price per piece",min_value=0.0,value=float(selected_row["price"] or 0),step=.5,format="%.2f"); edit_min=f2.number_input("Minimum order (pieces)",min_value=1,value=max(1,int(round(edit_min))),step=1)
+                    elif edit_mode == "tray":
+                        f1,f2=st.columns(2); edit_price=f1.number_input("Price per tray",min_value=0.0,value=float(selected_row["price"] or 0),step=.5,format="%.2f"); edit_min=f2.number_input("Minimum trays",min_value=.5,value=max(.5,float(edit_min)),step=.5)
+                    else:
+                        f1,f2=st.columns(2); edit_box=f1.number_input("Box price",min_value=0.0,value=float(existing_opts.get("Box",selected_row["price"] or 0)),step=.5,format="%.2f"); edit_half=f2.number_input("Half Tray price",min_value=0.0,value=float(existing_opts.get("Half Tray",selected_row["price"] or 0)),step=.5,format="%.2f"); edit_price=edit_box; edit_min=1
+                    edit_available = st.checkbox("Available to customers", value=bool(selected_row["available"]))
+                    save_item = st.form_submit_button("Save changes", type="primary", use_container_width=True)
+                    if save_item:
+                        try:
+                            save_menu_item(int(selected_id), edit_dish, edit_category, edit_price, edit_available, edit_mode, edit_min, edit_box, edit_half)
+                            st.success("Menu item updated.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not update dish: {exc}")
+
+                st.caption("Turning off **Available to customers** hides the dish without deleting its order history. Price changes also update the customer's Standard price automatically.")
 
         with announcement_tab:
             st.subheader("Customer announcements")

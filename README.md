@@ -1,13 +1,10 @@
-# Shukriya's Kitchen Invoice App v23
+# Shukriya's Kitchen — v28
 
-Manager-side revision:
+This version adds per-dish selling rules.
 
-- Kitchen address is now saved from **Manager > Settings** and printed on invoices.
-- Staff orders include an optional **Customer code / short name**.
-- Order History can search invoice number, customer name, short code, or phone.
-- Downloaded invoice filenames include the customer code when present, e.g. `HK-000023_ADIB.pdf`.
-- Staff orders include scrollable **Delivery date** and **Delivery time** selectors.
-- Delivery date/time can be edited later from Order History.
-- Delivery date/time are printed prominently in **bold** on PDF and direct-print invoices.
+## Selling modes
+- Piece: numeric quantity; configurable minimum order quantity.
+- Tray: numeric tray quantity in 0.5 increments.
+- Box / Half Tray: customer/staff selects Box or Half Tray, each with its own price.
 
-Supabase schema has already been updated for the connected project.
+The manager Menu tab can configure these fields directly. Supabase schema/RPCs were already upgraded for this project.

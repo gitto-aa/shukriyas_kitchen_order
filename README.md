@@ -121,3 +121,7 @@ Good next upgrades would be individual logins, an in-app menu editor for adminis
 
 ## v10 update
 The public customer page now includes a browsable menu grouped by category, showing all available dishes, options, and prices before the order builder.
+
+
+## v13 change
+For public **Main** dishes, customers enter tray quantity numerically (for example `0.5`, `1`, `1.5`, or `2`). The cart and invoice display the value as tray/trays automatically.

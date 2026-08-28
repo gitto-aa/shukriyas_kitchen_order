@@ -328,22 +328,19 @@ with public_tab:
         selected = dish_df.loc[dish_df["option_id"] == option_id].iloc[0]
         with qcol:
             if str(category).strip().casefold() == "main":
-                tray_choices = [
-                    (0.5, "1/2 tray"),
-                    (1.0, "1 tray"),
-                    (1.5, "1 1/2 trays"),
-                    (2.0, "2 trays"),
-                    (2.5, "2 1/2 trays"),
-                    (3.0, "3 trays"),
-                    (3.5, "3 1/2 trays"),
-                    (4.0, "4 trays"),
-                    (4.5, "4 1/2 trays"),
-                    (5.0, "5 trays"),
-                ]
-                tray_label = st.selectbox("Tray quantity", [label for _, label in tray_choices], index=1, key="public_tray_qty")
-                qty = next(value for value, label in tray_choices if label == tray_label)
-                quantity_label = tray_label
-                st.caption(f"Price shown is per tray: {money(float(selected['price']))}")
+                qty = float(st.number_input(
+                    "Tray quantity",
+                    min_value=0.5,
+                    max_value=20.0,
+                    value=1.0,
+                    step=0.5,
+                    format="%.1f",
+                    key="public_tray_qty",
+                    help="Enter the number of trays, for example 0.5, 1, 1.5, or 2.",
+                ))
+                qty_text = f"{qty:g}"
+                quantity_label = f"{qty_text} tray" if abs(qty - 1.0) < 1e-9 else f"{qty_text} trays"
+                st.caption(f"Enter trays as a number (for example 0.5 or 1.5). Price per tray: {money(float(selected['price']))}")
             else:
                 qty = float(st.number_input("Quantity", min_value=1, max_value=100, value=1, step=1, key="public_qty"))
                 quantity_label = str(int(qty))

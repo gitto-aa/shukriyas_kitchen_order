@@ -19,6 +19,58 @@ from supabase import Client, create_client
 
 st.set_page_config(page_title="Shukriya's Kitchen Orders", page_icon="🍽️", layout="centered")
 
+# Responsive presentation: desktop table + mobile cart cards.
+st.markdown(
+    """
+    <style>
+    /* Desktop is the default. */
+    .st-key-cart_mobile { display: none; }
+
+    /* Manager notification bell. A dynamic style adds the red dot only when needed. */
+    .st-key-manager_notification_bell button {
+        min-width: 3rem;
+        font-size: 1.15rem;
+    }
+
+    @media (max-width: 700px) {
+        /* Give the ordering UI more room on phones. */
+        [data-testid="stAppViewBlockContainer"] {
+            padding-left: 0.85rem !important;
+            padding-right: 0.85rem !important;
+            padding-top: 1.15rem !important;
+        }
+        h1 { font-size: 2rem !important; line-height: 1.15 !important; }
+        h2 { font-size: 1.55rem !important; }
+        h3 { font-size: 1.3rem !important; }
+
+        .st-key-cart_desktop { display: none !important; }
+        .st-key-cart_mobile { display: block !important; }
+
+        /* Keep the small quantity-control rows horizontal on mobile. */
+        .st-key-cart_mobile [data-testid="stHorizontalBlock"] {
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+            gap: 0.35rem !important;
+        }
+        .st-key-cart_mobile [data-testid="stColumn"] {
+            min-width: 0 !important;
+        }
+        .st-key-cart_mobile button {
+            min-height: 2.55rem !important;
+            padding: 0.25rem 0.45rem !important;
+        }
+        .st-key-cart_mobile p { margin-bottom: 0 !important; }
+    }
+
+    @media (min-width: 701px) {
+        .st-key-cart_desktop { display: block !important; }
+        .st-key-cart_mobile { display: none !important; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def setting(name: str, default: str = "") -> str:
     try:
@@ -121,6 +173,36 @@ def load_recent_orders(limit: int = 100) -> pd.DataFrame:
         .order("created_at", desc=True).limit(limit).execute()
     )
     return pd.DataFrame(response.data or [])
+
+
+def load_new_online_orders(limit: int = 25) -> list[dict]:
+    """Fetch unprocessed customer orders for the manager notification bell."""
+    response = (
+        get_db().table("orders")
+        .select("id,invoice_number,created_at,customer,total,order_status,order_source")
+        .eq("order_source", "Online")
+        .eq("order_status", "New")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return list(response.data or [])
+
+
+def relative_time(value: str | datetime) -> str:
+    dt = local_datetime(value)
+    now = datetime.now(tz=dt.tzinfo)
+    seconds = max(0, int((now - dt).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hr ago" if hours == 1 else f"{hours} hrs ago"
+    days = hours // 24
+    return f"{days} day ago" if days == 1 else f"{days} days ago"
 
 
 def parse_quantity(text: str) -> tuple[float, str]:
@@ -258,6 +340,87 @@ def update_order_workflow(order_id, status, assigned_to):
     return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
+def cart_item_is_tray(item: dict) -> bool:
+    return str(item.get("category") or "").strip().casefold() in {"main", "side"}
+
+
+def cart_quantity_label(item: dict, qty: float) -> str:
+    if cart_item_is_tray(item):
+        qtxt = f"{qty:g}"
+        return f"{qtxt} tray" if abs(qty - 1.0) < 1e-9 else f"{qtxt} trays"
+    return str(int(round(qty)))
+
+
+def adjust_public_cart_item(index: int, delta: float) -> None:
+    item = st.session_state.public_cart[index]
+    is_tray = cart_item_is_tray(item)
+    minimum = 0.5 if is_tray else 1.0
+    current = float(item.get("qty", minimum))
+    new_qty = max(minimum, current + delta)
+    item["qty"] = new_qty
+    item["quantity_label"] = cart_quantity_label(item, new_qty)
+    item["line_total"] = new_qty * float(item["price"])
+
+
+def public_cart_item_name(item: dict) -> str:
+    option = str(item.get("option") or "").strip()
+    name = str(item["dish"])
+    if option and option.casefold() != "standard":
+        name = f"{name} — {option}"
+    return name
+
+
+@st.fragment(run_every="5s")
+def manager_notification_center() -> None:
+    """Small polling fragment so the manager sees new online orders without reloading the page."""
+    try:
+        pending = load_new_online_orders()
+    except Exception as exc:
+        st.caption(f"Notifications unavailable: {exc}")
+        return
+
+    count = len(pending)
+    if count:
+        # Add a small red status dot to the keyed bell button.
+        st.markdown(
+            """
+            <style>
+            .st-key-manager_notification_bell button { position: relative; }
+            .st-key-manager_notification_bell button::after {
+                content: ''; position: absolute; width: .62rem; height: .62rem;
+                border-radius: 50%; background: #ff4b4b; top: .28rem; right: .35rem;
+                border: 2px solid var(--background-color, transparent);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    label = f"🔔 {count}" if count else "🔔"
+    if st.button(label, key="manager_notification_bell", help=f"{count} new online order(s)" if count else "No new online orders", use_container_width=True):
+        st.session_state.show_manager_notifications = not st.session_state.get("show_manager_notifications", False)
+
+    if st.session_state.get("show_manager_notifications", False):
+        if not pending:
+            st.caption("No new online orders.")
+        else:
+            st.markdown(f"**{count} new online order{'s' if count != 1 else ''}**")
+            for order in pending[:8]:
+                customer = str(order.get("customer") or "Customer")
+                invoice = str(order.get("invoice_number") or "")
+                total = money(float(order.get("total") or 0))
+                when = relative_time(order.get("created_at"))
+                st.markdown(
+                    f"<div style='padding:.25rem 0;border-bottom:1px solid rgba(128,128,128,.18)'>"
+                    f"<b>{escape(invoice)}</b> · {escape(customer)} · <b>{escape(total)}</b><br>"
+                    f"<span style='opacity:.7;font-size:.86rem'>{escape(when)}</span></div>",
+                    unsafe_allow_html=True,
+                )
+            if count > 8:
+                st.caption(f"+ {count - 8} more new orders")
+            st.caption("Open Order history to assign or confirm them. The badge clears as orders leave New status.")
+
+
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     st.title(f"🍽️ {BUSINESS_NAME} Orders")
     st.error("Supabase credentials are not configured.")
@@ -272,7 +435,7 @@ except Exception as exc:
     st.error(f"Could not connect to the ordering database: {exc}")
     st.stop()
 
-for key, default in [("public_cart", []), ("staff_cart", []), ("public_confirmation", None), ("staff_invoice", None), ("manager_authenticated", False)]:
+for key, default in [("public_cart", []), ("staff_cart", []), ("public_confirmation", None), ("staff_invoice", None), ("manager_authenticated", False), ("show_manager_notifications", False)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -359,66 +522,85 @@ with public_tab:
         if not st.session_state.public_cart:
             st.info("Your cart is empty.")
         else:
-            # Compact cart table with quantity controls.
-            header = st.columns([3.4, 2.6, 1.5, 1.5, 0.7])
-            header[0].markdown("**Item**")
-            header[1].markdown("**Qty**")
-            header[2].markdown("**Unit**")
-            header[3].markdown("**Total**")
-            header[4].markdown("**Remove**")
+            # Desktop cart: table-like layout. Hidden automatically on narrow screens.
+            with st.container(key="cart_desktop"):
+                header = st.columns([3.4, 2.6, 1.5, 1.5, 0.7])
+                header[0].markdown("**Item**")
+                header[1].markdown("**Qty**")
+                header[2].markdown("**Unit**")
+                header[3].markdown("**Total**")
+                header[4].markdown("**Remove**")
 
-            for idx, item in enumerate(st.session_state.public_cart):
-                option = str(item.get("option") or "").strip()
-                item_name = str(item["dish"])
-                if option and option.casefold() != "standard":
-                    item_name = f"{item_name} — {option}"
+                for idx, item in enumerate(st.session_state.public_cart):
+                    item_name = public_cart_item_name(item)
+                    is_tray = cart_item_is_tray(item)
+                    step = 0.5 if is_tray else 1.0
+                    minimum = 0.5 if is_tray else 1.0
+                    qty_value = float(item.get("qty", minimum))
 
-                category_name = str(item.get("category") or "").strip().casefold()
-                is_tray = category_name in {"main", "side"}
-                step = 0.5 if is_tray else 1.0
-                minimum = 0.5 if is_tray else 1.0
-                qty_value = float(item.get("qty", minimum))
+                    row = st.columns([3.4, 2.6, 1.5, 1.5, 0.7], vertical_alignment="center")
+                    row[0].markdown(f"**{escape(item_name)}**")
 
-                row = st.columns([3.4, 2.6, 1.5, 1.5, 0.7], vertical_alignment="center")
-                row[0].markdown(item_name)
+                    with row[1]:
+                        minus_col, qty_col, plus_col = st.columns([1, 1.6, 1])
+                        if minus_col.button("−", key=f"desktop_minus_{idx}",
+                                            disabled=qty_value <= minimum + 1e-9,
+                                            use_container_width=True):
+                            adjust_public_cart_item(idx, -step)
+                            st.rerun()
+                        display_qty = str(item.get("quantity_label") or cart_quantity_label(item, qty_value))
+                        qty_col.markdown(
+                            f"<div style='text-align:center;white-space:nowrap;padding-top:.45rem'>{escape(display_qty)}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        if plus_col.button("+", key=f"desktop_plus_{idx}", use_container_width=True):
+                            adjust_public_cart_item(idx, step)
+                            st.rerun()
 
-                with row[1]:
-                    minus_col, qty_col, plus_col = st.columns([1, 1.5, 1])
-                    if minus_col.button("−", key=f"cart_minus_{idx}",
-                                        disabled=qty_value <= minimum + 1e-9,
-                                        use_container_width=True):
-                        new_qty = max(minimum, qty_value - step)
-                        item["qty"] = new_qty
-                        if is_tray:
-                            qtxt = f"{new_qty:g}"
-                            item["quantity_label"] = f"{qtxt} tray" if abs(new_qty - 1.0) < 1e-9 else f"{qtxt} trays"
-                        else:
-                            item["quantity_label"] = str(int(round(new_qty)))
-                        item["line_total"] = new_qty * float(item["price"])
+                    row[2].markdown(money(float(item["price"])))
+                    row[3].markdown(f"**{money(float(item['line_total']))}**")
+                    if row[4].button("×", key=f"desktop_remove_{idx}", help="Remove item", use_container_width=True):
+                        st.session_state.public_cart.pop(idx)
                         st.rerun()
-                    display_qty = str(item.get("quantity_label") or f"{qty_value:g}")
-                    qty_col.markdown(
-                        f"<div style='text-align:center; white-space:nowrap; padding-top:0.45rem;'>{display_qty}</div>",
+                    st.markdown("<hr style='margin:.2rem 0 .35rem;opacity:.18'>", unsafe_allow_html=True)
+
+            # Mobile cart: item summary + one compact control row.
+            # This avoids Streamlit stacking a five-column table vertically on phones.
+            with st.container(key="cart_mobile"):
+                for idx, item in enumerate(st.session_state.public_cart):
+                    item_name = public_cart_item_name(item)
+                    is_tray = cart_item_is_tray(item)
+                    step = 0.5 if is_tray else 1.0
+                    minimum = 0.5 if is_tray else 1.0
+                    qty_value = float(item.get("qty", minimum))
+                    display_qty = str(item.get("quantity_label") or cart_quantity_label(item, qty_value))
+                    unit_note = "per tray" if is_tray else "each"
+
+                    top_left, top_right = st.columns([3.2, 1.2], vertical_alignment="center")
+                    top_left.markdown(f"**{escape(item_name)}**")
+                    top_right.markdown(
+                        f"<div style='text-align:right;font-weight:700'>{escape(money(float(item['line_total'])))}</div>",
                         unsafe_allow_html=True,
                     )
-                    if plus_col.button("+", key=f"cart_plus_{idx}", use_container_width=True):
-                        new_qty = qty_value + step
-                        item["qty"] = new_qty
-                        if is_tray:
-                            qtxt = f"{new_qty:g}"
-                            item["quantity_label"] = f"{qtxt} tray" if abs(new_qty - 1.0) < 1e-9 else f"{qtxt} trays"
-                        else:
-                            item["quantity_label"] = str(int(round(new_qty)))
-                        item["line_total"] = new_qty * float(item["price"])
+                    st.caption(f"{money(float(item['price']))} {unit_note}")
+
+                    minus_col, qty_col, plus_col, remove_col = st.columns([1, 1.8, 1, 1])
+                    if minus_col.button("−", key=f"mobile_minus_{idx}",
+                                        disabled=qty_value <= minimum + 1e-9,
+                                        use_container_width=True):
+                        adjust_public_cart_item(idx, -step)
                         st.rerun()
-
-                row[2].markdown(money(float(item["price"])))
-                row[3].markdown(f"**{money(float(item['line_total']))}**")
-                if row[4].button("×", key=f"cart_remove_{idx}", help="Remove item", use_container_width=True):
-                    st.session_state.public_cart.pop(idx)
-                    st.rerun()
-
-                st.markdown("<hr style='margin:0.25rem 0 0.45rem 0; opacity:0.22;'>", unsafe_allow_html=True)
+                    qty_col.markdown(
+                        f"<div style='text-align:center;white-space:nowrap;padding:.58rem .1rem;font-weight:600'>{escape(display_qty)}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if plus_col.button("+", key=f"mobile_plus_{idx}", use_container_width=True):
+                        adjust_public_cart_item(idx, step)
+                        st.rerun()
+                    if remove_col.button("×", key=f"mobile_remove_{idx}", help="Remove item", use_container_width=True):
+                        st.session_state.public_cart.pop(idx)
+                        st.rerun()
+                    st.markdown("<hr style='margin:.35rem 0 .55rem;opacity:.18'>", unsafe_allow_html=True)
 
             subtotal = sum(i["line_total"] for i in st.session_state.public_cart)
             total_left, total_right = st.columns([3, 2])
@@ -468,10 +650,14 @@ with manager_tab:
     else:
         if not APP_PASSWORD:
             st.warning("APP_PASSWORD is empty, so the manager area is not protected.")
-        top1, top2 = st.columns([4,1])
+        top1, top2, top3 = st.columns([4, 1.05, 1.15], vertical_alignment="center")
         top1.subheader("Manager dashboard")
-        if top2.button("Sign out", use_container_width=True):
-            st.session_state.manager_authenticated = False; st.rerun()
+        with top2:
+            manager_notification_center()
+        if top3.button("Sign out", use_container_width=True):
+            st.session_state.manager_authenticated = False
+            st.session_state.show_manager_notifications = False
+            st.rerun()
 
         staff_tab, history_tab, menu_tab = st.tabs(["Staff order", "Order history", "Menu"])
 

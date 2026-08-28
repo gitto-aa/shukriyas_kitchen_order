@@ -287,26 +287,32 @@ with public_tab:
         categories = sorted(public_menu["category"].unique().tolist(), key=str.casefold)
 
         st.subheader("Browse menu")
-        st.caption("Browse all currently available dishes and prices before placing your order.")
+        st.caption("Current dishes and prices")
         for menu_category in categories:
             category_df = public_menu[public_menu["category"] == menu_category].copy()
-            with st.expander(str(menu_category), expanded=str(menu_category).strip().casefold() == "main"):
+            with st.expander(str(menu_category), expanded=False):
+                compact_rows = []
                 for menu_dish in sorted(category_df["dish"].unique().tolist(), key=str.casefold):
                     dish_options = category_df[category_df["dish"] == menu_dish].sort_values(["sort_order", "price"])
-                    st.markdown(f"**{menu_dish}**")
-                    if len(dish_options) == 1 and str(dish_options.iloc[0]["option"]).strip().casefold() == "standard":
-                        price_text = money(float(dish_options.iloc[0]["price"]))
-                        if str(menu_category).strip().casefold() == "main":
-                            price_text += " / tray"
-                        st.write(price_text)
-                    else:
-                        for _, menu_option in dish_options.iterrows():
-                            label = str(menu_option["option"])
-                            price_text = money(float(menu_option["price"]))
-                            if str(menu_category).strip().casefold() == "main" and label.strip().casefold() == "standard":
-                                price_text += " / tray"
-                            st.write(f"{label} — {price_text}")
-                    st.divider()
+                    option_parts = []
+                    for _, menu_option in dish_options.iterrows():
+                        label = str(menu_option["option"]).strip()
+                        price_text = money(float(menu_option["price"]))
+                        if label.casefold() == "standard":
+                            if str(menu_category).strip().casefold() == "main":
+                                option_parts.append(f"{escape(price_text)} / tray")
+                            else:
+                                option_parts.append(escape(price_text))
+                        else:
+                            option_parts.append(f"{escape(label)}: {escape(price_text)}")
+                    compact_rows.append(
+                        "<div style='display:flex;justify-content:space-between;align-items:baseline;"
+                        "gap:1rem;padding:.16rem 0;line-height:1.35'>"
+                        f"<span style='font-weight:600'>{escape(str(menu_dish))}</span>"
+                        f"<span style='text-align:right;white-space:nowrap'>{' · '.join(option_parts)}</span>"
+                        "</div>"
+                    )
+                st.markdown("".join(compact_rows), unsafe_allow_html=True)
 
         st.subheader("Build your order")
         category = st.selectbox("Category", categories, key="public_category")

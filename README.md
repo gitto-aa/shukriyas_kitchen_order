@@ -1,10 +1,3 @@
-# Shukriya's Kitchen — v28
+# Shukriya's Kitchen — v30
 
-This version adds per-dish selling rules.
-
-## Selling modes
-- Piece: numeric quantity; configurable minimum order quantity.
-- Tray: numeric tray quantity in 0.5 increments.
-- Box / Half Tray: customer/staff selects Box or Half Tray, each with its own price.
-
-The manager Menu tab can configure these fields directly. Supabase schema/RPCs were already upgraded for this project.
+Manager menu editor now supports multiple selling formats per dish: Piece, Small Box, Box, and Half Tray, each with its own price. Piece items can also define a minimum order quantity. Existing special menu formats are preserved.

@@ -33,19 +33,45 @@ def nested_secret(section: str, name: str, default: str = "") -> str:
         return default
 
 
+def first_secret(*names: str) -> str:
+    """Return the first non-empty top-level Streamlit secret or environment variable."""
+    import os
+
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        except Exception:
+            pass
+        value = os.environ.get(name, "")
+        if value.strip():
+            return value.strip()
+    return ""
+
+
 BUSINESS_NAME = setting("BUSINESS_NAME", "My Home Kitchen")
 BUSINESS_PHONE = setting("BUSINESS_PHONE", "")
 BUSINESS_ADDRESS = setting("BUSINESS_ADDRESS", "")
 CURRENCY = setting("CURRENCY", "$")
 APP_TIMEZONE = setting("APP_TIMEZONE", "America/Los_Angeles")
 APP_PASSWORD = setting("APP_PASSWORD", "")
-SUPABASE_URL = nested_secret("supabase", "url")
-SUPABASE_SERVICE_ROLE_KEY = nested_secret("supabase", "service_role_key")
+
+# Prefer simple top-level Streamlit secrets. Keep nested names for backward compatibility.
+SUPABASE_URL = (
+    first_secret("SUPABASE_URL", "supabase_url")
+    or nested_secret("supabase", "url")
+).strip()
+SUPABASE_SECRET_KEY = (
+    first_secret("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY", "supabase_secret_key")
+    or nested_secret("supabase", "secret_key")
+    or nested_secret("supabase", "service_role_key")
+).strip()
 
 
 @st.cache_resource
 def get_db() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -316,12 +342,29 @@ def require_password() -> None:
     st.stop()
 
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     st.title("🍽️ Home Kitchen Orders")
-    st.error("Supabase is not configured yet.")
+    st.error("Supabase credentials are not being detected by this Streamlit app.")
+    st.write(
+        {
+            "Supabase URL detected": bool(SUPABASE_URL),
+            "Supabase secret key detected": bool(SUPABASE_SECRET_KEY),
+        }
+    )
     st.markdown(
-        "Create `.streamlit/secrets.toml` from `secrets.example.toml`, then add your Supabase project URL and service-role key. "
-        "Run `database.sql` once in the Supabase SQL Editor before starting the app."
+        """In **Streamlit Community Cloud → Manage app → Settings → Secrets**, use this exact top-level format:
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
+SUPABASE_SECRET_KEY = "sb_secret_YOUR_KEY"
+
+BUSINESS_NAME = "My Home Kitchen"
+CURRENCY = "$"
+APP_TIMEZONE = "America/Los_Angeles"
+APP_PASSWORD = "choose-a-password"
+```
+
+Save the secrets, then reboot the app. Do not put these credentials in GitHub."""
     )
     st.stop()
 

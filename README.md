@@ -67,16 +67,16 @@ APP_PASSWORD = "your-shared-app-password"
 
 [supabase]
 url = "https://YOUR_PROJECT.supabase.co"
-service_role_key = "YOUR_SUPABASE_SERVICE_ROLE_KEY"
+secret_key = "YOUR_SUPABASE_SECRET_KEY"
 ```
 
 You can find the project URL and API keys in the Supabase project settings.
 
 ### Security
 
-The `service_role_key` must remain server-side. Do **not** put it directly inside `app.py` and do **not** commit `.streamlit/secrets.toml` to GitHub. The included `.gitignore` already excludes that file.
+The `secret_key` must remain server-side. Do **not** put it directly inside `app.py` and do **not** commit `.streamlit/secrets.toml` to GitHub. The included `.gitignore` already excludes that file.
 
-The SQL script enables Row Level Security without creating browser-access policies. The Streamlit server accesses the database using the service-role credential stored in Streamlit Secrets.
+The SQL script enables Row Level Security without creating browser-access policies. The Streamlit server accesses the database using the server-side secret credential stored in Streamlit Secrets.
 
 ## 4. Run locally
 

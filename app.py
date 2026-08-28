@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date, timedelta, time
 from fractions import Fraction
 from html import escape
 from io import BytesIO
@@ -167,6 +167,47 @@ def load_managers() -> list[str]:
     return [str(row["name"]) for row in response.data or []]
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_store_settings() -> dict[str, str]:
+    response = get_db().table("store_settings").select("key,value").execute()
+    return {str(r["key"]): str(r.get("value") or "") for r in response.data or []}
+
+
+def save_store_setting(key: str, value: str) -> None:
+    get_db().table("store_settings").upsert({"key": key, "value": value.strip()}, on_conflict="key").execute()
+    load_store_settings.clear()
+
+
+def kitchen_address() -> str:
+    try:
+        return load_store_settings().get("kitchen_address", "").strip() or BUSINESS_ADDRESS
+    except Exception:
+        return BUSINESS_ADDRESS
+
+
+def delivery_date_options(days: int = 120) -> list[date]:
+    today = datetime.now(ZoneInfo(APP_TIMEZONE)).date()
+    return [today + timedelta(days=i) for i in range(days)]
+
+
+def delivery_time_options(start_hour: int = 8, end_hour: int = 22, step_minutes: int = 30) -> list[time]:
+    out = []
+    minutes = start_hour * 60
+    end = end_hour * 60
+    while minutes <= end:
+        out.append(time(minutes // 60, minutes % 60))
+        minutes += step_minutes
+    return out
+
+
+def format_delivery_date(d: date) -> str:
+    return d.strftime("%a, %b %d, %Y")
+
+
+def format_delivery_time(t: time) -> str:
+    return datetime.combine(date.today(), t).strftime("%I:%M %p").lstrip("0")
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def load_active_announcements() -> list[dict]:
     response = (
@@ -238,7 +279,7 @@ def render_customer_announcements() -> None:
 def load_recent_orders(limit: int = 100) -> pd.DataFrame:
     response = (
         get_db().table("orders")
-        .select("id,invoice_number,created_at,order_source,order_taker,assigned_to,customer,phone,total,payment_status,payment_method,payment_received_by,paid_at,order_status")
+        .select("id,invoice_number,created_at,order_source,order_taker,customer,customer_code,phone,delivery_date,delivery_time,total,payment_status,payment_method,payment_received_by,paid_at,order_status")
         .order("created_at", desc=True).limit(limit).execute()
     )
     return pd.DataFrame(response.data or [])
@@ -357,7 +398,7 @@ def build_invoice_pdf(order: dict) -> bytes:
     story = []
 
     # Header: business identity on the left, invoice identity on the right.
-    contact = "<br/>".join(escape(x) for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
+    contact = "<br/>".join(escape(x) for x in [kitchen_address(), BUSINESS_PHONE] if x)
     business_block = escape(BUSINESS_NAME)
     if contact:
         business_block += f"<br/><font size='7' color='#666666'>{contact}</font>"
@@ -383,7 +424,11 @@ def build_invoice_pdf(order: dict) -> bytes:
     # fields so the invoice never wastes vertical space.
     customer_lines = []
     if order.get("customer"):
-        customer_lines.append(f"<b>Bill to:</b> {escape(str(order['customer']))}")
+        customer_name = escape(str(order['customer']))
+        code = str(order.get("customer_code") or "").strip()
+        if code:
+            customer_name += f" <b>({escape(code)})</b>"
+        customer_lines.append(f"<b>Bill to:</b> {customer_name}")
     if order.get("phone"):
         customer_lines.append(escape(str(order["phone"])))
     if order.get("address"):
@@ -394,6 +439,33 @@ def build_invoice_pdf(order: dict) -> bytes:
         order_lines.append(f"<b>Source:</b> {escape(str(order['order_source']))}")
     if order.get("order_taker"):
         order_lines.append(f"<b>Taken by:</b> {escape(str(order['order_taker']))}")
+
+    delivery_bits = []
+    if order.get("delivery_date"):
+        try:
+            dd = date.fromisoformat(str(order["delivery_date"])).strftime("%A, %B %d, %Y")
+        except Exception:
+            dd = str(order["delivery_date"])
+        delivery_bits.append(dd)
+    if order.get("delivery_time"):
+        rawt = str(order["delivery_time"])[:5]
+        try:
+            tt = datetime.strptime(rawt, "%H:%M").strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            tt = rawt
+        delivery_bits.append(tt)
+    if delivery_bits:
+        delivery_text = " &nbsp; | &nbsp; ".join(escape(x) for x in delivery_bits)
+        story.extend([
+            Table([[Paragraph(f"<b>DELIVERY: {delivery_text}</b>", ParagraphStyle(
+                "DeliveryBanner", parent=body, fontName="Helvetica-Bold", fontSize=10.2, leading=12
+            ))]], colWidths=[usable_width], style=TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F3F3F3")),
+                ("BOX", (0,0), (-1,-1), .7, colors.HexColor("#777777")),
+                ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
+                ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ])), Spacer(1, 5)
+        ])
 
     if customer_lines or order_lines:
         details = Table(
@@ -544,7 +616,11 @@ def build_invoice_print_html(order: dict) -> str:
 
     customer_bits = []
     if order.get("customer"):
-        customer_bits.append(f'<strong>{escape(str(order["customer"]))}</strong>')
+        customer_label = escape(str(order["customer"]))
+        code = str(order.get("customer_code") or "").strip()
+        if code:
+            customer_label += f' <strong>({escape(code)})</strong>'
+        customer_bits.append(f'<strong>{customer_label}</strong>')
     if order.get("phone"):
         customer_bits.append(escape(str(order["phone"])))
     if order.get("address"):
@@ -558,7 +634,22 @@ def build_invoice_print_html(order: dict) -> str:
         source_bits.append(f'Taken by: {escape(str(order["order_taker"]))}')
     source_html = "<br>".join(source_bits)
 
-    contact = "<br>".join(escape(x) for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
+    contact = "<br>".join(escape(x) for x in [kitchen_address(), BUSINESS_PHONE] if x)
+    delivery_parts = []
+    if order.get("delivery_date"):
+        try:
+            delivery_parts.append(date.fromisoformat(str(order["delivery_date"])).strftime("%A, %B %d, %Y"))
+        except Exception:
+            delivery_parts.append(str(order["delivery_date"]))
+    if order.get("delivery_time"):
+        rawt = str(order["delivery_time"])[:5]
+        try:
+            delivery_parts.append(datetime.strptime(rawt, "%H:%M").strftime("%I:%M %p").lstrip("0"))
+        except Exception:
+            delivery_parts.append(rawt)
+    delivery_html = ""
+    if delivery_parts:
+        delivery_html = f'<div class="delivery"><strong>DELIVERY: {escape(" | ".join(delivery_parts))}</strong></div>'
     notes_html = ""
     if order.get("notes"):
         notes_html = f'<div class="notes"><strong>Notes:</strong> {escape(str(order["notes"]))}</div>'
@@ -585,6 +676,7 @@ def build_invoice_print_html(order: dict) -> str:
   .divider {{ border-top:1px solid #bbb; margin:8px 0; }}
   .details {{ display:flex; justify-content:space-between; gap:14px; }}
   .details > div:last-child {{ text-align:right; }}
+  .delivery {{ margin:8px 0; padding:7px 8px; border:1px solid #888; background:#f4f4f4; font-size:13px; }}
   table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
   th {{ background:#f2f2f2; font-weight:700; border-bottom:1px solid #aaa; }}
   th, td {{ padding:5px 4px; text-align:left; vertical-align:top; }}
@@ -618,6 +710,7 @@ def build_invoice_print_html(order: dict) -> str:
       <div>{customer_html}</div>
       <div class="muted">{source_html}</div>
     </div>
+    {delivery_html}
     <table>
       <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Amount</th></tr></thead>
       <tbody>{items_html}</tbody>
@@ -687,7 +780,8 @@ def fetch_order_for_pdf(order_id: int) -> dict:
     return {
         "invoice_number": row["invoice_number"], "date": created.strftime("%B %d, %Y %I:%M %p"),
         "order_source": row.get("order_source"), "order_taker": row.get("order_taker"), "customer": row.get("customer"),
-        "phone": row.get("phone"), "address": row.get("address"), "notes": row.get("notes"),
+        "customer_code": row.get("customer_code"), "phone": row.get("phone"), "address": row.get("address"), "notes": row.get("notes"),
+        "delivery_date": row.get("delivery_date"), "delivery_time": row.get("delivery_time"),
         "items": [{"dish": i["dish"], "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"]),
                    "price": float(i["unit_price"]), "line_total": float(i["line_total"])} for i in items],
         "subtotal": float(row["subtotal"]), "delivery_fee": float(row["delivery_fee"]), "discount": float(row["discount"]),
@@ -695,13 +789,36 @@ def fetch_order_for_pdf(order_id: int) -> dict:
     }
 
 
-def create_staff_order(order_taker, customer, phone, address, notes, cart, delivery_fee, discount, tax_percent):
+def create_staff_order(order_taker, customer, customer_code, phone, address, notes, delivery_date, delivery_time, cart, delivery_fee, discount, tax_percent):
     payload = [{"menu_item_id": int(i["menu_item_id"]), "qty": float(i["qty"]), "quantity_label": i.get("quantity_label") or str(i["qty"])} for i in cart]
     r = get_db().rpc("create_kitchen_order", {"p_order_taker": order_taker or None, "p_customer": customer or None,
         "p_phone": phone or None, "p_address": address or None, "p_notes": notes or None, "p_items": payload,
         "p_delivery_fee": float(delivery_fee), "p_discount": float(discount), "p_tax_percent": float(tax_percent)}).execute()
     if not r.data: raise RuntimeError("Supabase did not return the newly created order.")
-    return r.data[0] if isinstance(r.data, list) else r.data
+    created = r.data[0] if isinstance(r.data, list) else r.data
+    get_db().table("orders").update({
+        "customer_code": customer_code.strip() or None,
+        "delivery_date": delivery_date.isoformat() if delivery_date else None,
+        "delivery_time": delivery_time.strftime("%H:%M:%S") if delivery_time else None,
+    }).eq("id", int(created["order_id"])).execute()
+    return created
+
+
+def update_order_details(order_id: int, customer: str, customer_code: str, delivery_date_value: date | None, delivery_time_value: time | None) -> None:
+    get_db().table("orders").update({
+        "customer": customer.strip() or None,
+        "customer_code": customer_code.strip() or None,
+        "delivery_date": delivery_date_value.isoformat() if delivery_date_value else None,
+        "delivery_time": delivery_time_value.strftime("%H:%M:%S") if delivery_time_value else None,
+    }).eq("id", int(order_id)).execute()
+    load_recent_orders.clear()
+
+
+def invoice_filename(order: dict) -> str:
+    code = str(order.get("customer_code") or "").strip()
+    safe = "".join(ch for ch in code if ch.isalnum() or ch in ("-", "_")).strip("-_")
+    base = str(order["invoice_number"])
+    return f"{base}_{safe}.pdf" if safe else f"{base}.pdf"
 
 
 def create_public_order(customer, phone, address, notes, cart):
@@ -718,9 +835,9 @@ def update_order_payment(order_id, status, method, receiver):
     return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
-def update_order_workflow(order_id, status, assigned_to):
+def update_order_workflow(order_id, status):
     r = get_db().rpc("update_order_workflow", {"p_order_id": int(order_id), "p_order_status": status,
-        "p_assigned_to": assigned_to}).execute()
+        "p_assigned_to": None}).execute()
     return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
@@ -1044,7 +1161,7 @@ with manager_tab:
             st.session_state.show_manager_notifications = False
             st.rerun()
 
-        staff_tab, history_tab, menu_tab, announcement_tab = st.tabs(["Staff order", "Order history", "Menu", "Announcements"])
+        staff_tab, history_tab, menu_tab, announcement_tab, settings_tab = st.tabs(["Staff order", "Order history", "Menu", "Announcements", "Settings"])
 
         with staff_tab:
             if menu.empty:
@@ -1054,10 +1171,16 @@ with manager_tab:
                 with c1:
                     order_taker = st.selectbox("Order taken by", managers if managers else [""], key="staff_order_taker")
                     customer = st.text_input("Customer name", key="staff_customer")
+                    customer_code = st.text_input("Customer code / short name", placeholder="e.g. ADIB, RUMEE-1", key="staff_customer_code")
                     phone = st.text_input("Phone", key="staff_phone")
                 with c2:
-                    address = st.text_area("Address", height=68, key="staff_address")
+                    address = st.text_area("Customer address", height=68, key="staff_address")
                     notes = st.text_area("Order notes", height=68, key="staff_notes")
+                d1, d2 = st.columns(2)
+                date_options = delivery_date_options()
+                time_options = delivery_time_options()
+                delivery_date_value = d1.selectbox("Delivery date", date_options, format_func=format_delivery_date, key="staff_delivery_date")
+                delivery_time_value = d2.selectbox("Delivery time", time_options, format_func=format_delivery_time, key="staff_delivery_time")
                 st.markdown("### Add dishes")
                 categories = sorted(menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(), key=str.casefold)
                 cc,dc,qc = st.columns([2,3,1.5])
@@ -1095,7 +1218,7 @@ with manager_tab:
                     st.markdown(f"### Estimated total: {money(est)}")
                     if st.button("Save & generate invoice", type="primary", use_container_width=True):
                         try:
-                            created = create_staff_order(order_taker, customer, phone, address, notes, st.session_state.staff_cart, delivery, discount, tax)
+                            created = create_staff_order(order_taker, customer, customer_code, phone, address, notes, delivery_date_value, delivery_time_value, st.session_state.staff_cart, delivery, discount, tax)
                             order = fetch_order_for_pdf(int(created["order_id"]))
                             st.session_state.staff_invoice = {"number": order["invoice_number"], "pdf": build_invoice_pdf(order), "order": order}
                             st.session_state.staff_cart = []; load_recent_orders.clear(); st.rerun()
@@ -1106,7 +1229,7 @@ with manager_tab:
                     st.success(f"Invoice {inv['number']} saved.")
                     dl_col, print_col = st.columns(2)
                     with dl_col:
-                        st.download_button("Download PDF invoice", data=inv["pdf"], file_name=f"{inv['number']}.pdf", mime="application/pdf", use_container_width=True)
+                        st.download_button("Download PDF invoice", data=inv["pdf"], file_name=invoice_filename(inv["order"]), mime="application/pdf", use_container_width=True)
                     with print_col:
                         if inv.get("order"):
                             render_print_button(inv["order"])
@@ -1119,30 +1242,75 @@ with manager_tab:
             if orders.empty:
                 st.info("No orders yet.")
             else:
-                display = orders.copy()
+                search_orders = st.text_input("Find invoice", placeholder="Search invoice #, customer name, short code, or phone", key="history_search")
+                if search_orders.strip():
+                    q = search_orders.strip().casefold()
+                    mask = orders.apply(lambda r: any(q in str(r.get(c) or "").casefold() for c in ["invoice_number","customer","customer_code","phone"]), axis=1)
+                    filtered_orders = orders[mask].copy()
+                else:
+                    filtered_orders = orders.copy()
+                if filtered_orders.empty:
+                    st.info("No matching orders. Clear the search box to show all invoices.")
+                    filtered_orders = orders.copy()
+                display = filtered_orders.copy()
                 display["created_at"] = display["created_at"].map(lambda x: local_datetime(x).strftime("%b %d, %Y %I:%M %p"))
+                if "delivery_date" in display.columns:
+                    display["delivery_date"] = display["delivery_date"].map(lambda x: date.fromisoformat(str(x)).strftime("%b %d") if pd.notna(x) and str(x) not in {"", "None"} else "-")
+                if "delivery_time" in display.columns:
+                    def _fmt_hist_time(x):
+                        if pd.isna(x) or str(x) in {"", "None"}: return "-"
+                        try: return datetime.strptime(str(x)[:5], "%H:%M").strftime("%I:%M %p").lstrip("0")
+                        except Exception: return str(x)
+                    display["delivery_time"] = display["delivery_time"].map(_fmt_hist_time)
                 display["total"] = display["total"].map(money)
                 display = display.rename(columns={"invoice_number":"Invoice","created_at":"Date","order_source":"Source","order_taker":"Taken by",
-                    "assigned_to":"Assigned to","customer":"Customer","total":"Total","payment_status":"Payment","payment_method":"Method",
+                    "customer":"Customer","customer_code":"Code","delivery_date":"Delivery date","delivery_time":"Delivery time","total":"Total","payment_status":"Payment","payment_method":"Method",
                     "payment_received_by":"Received by","order_status":"Status"})
-                for col in ["Taken by","Assigned to","Method","Received by"]: display[col] = display[col].fillna("-")
-                st.dataframe(display[["Invoice","Date","Source","Customer","Total","Status","Assigned to","Payment","Method","Received by","Taken by"]],
+                for col in ["Taken by","Method","Received by"]: display[col] = display[col].fillna("-")
+                st.dataframe(display[["Invoice","Customer","Code","Delivery date","Delivery time","Total","Status","Payment","Method","Received by","Taken by"]],
                              use_container_width=True, hide_index=True)
-                chosen = st.selectbox("Select order", orders["invoice_number"].tolist(), key="history_order")
+                chosen = st.selectbox("Select order", filtered_orders["invoice_number"].tolist(),
+                    format_func=lambda inv: f"{inv} · {filtered_orders.loc[filtered_orders['invoice_number']==inv, 'customer_code'].iloc[0] or filtered_orders.loc[filtered_orders['invoice_number']==inv, 'customer'].iloc[0] or 'Customer'}",
+                    key="history_order")
                 row = orders.loc[orders["invoice_number"]==chosen].iloc[0]
+                st.markdown("#### Customer & delivery")
+                e1,e2,e3,e4,e5 = st.columns([1.7,1.2,1.4,1.3,1])
+                edit_customer = e1.text_input("Customer", value=str(row.get("customer") or ""), key=f"edit_customer_{row['id']}")
+                edit_code = e2.text_input("Short code", value=str(row.get("customer_code") or ""), key=f"edit_code_{row['id']}")
+                date_opts = delivery_date_options()
+                current_dd = None
+                try:
+                    current_dd = date.fromisoformat(str(row.get("delivery_date"))) if row.get("delivery_date") else date_opts[0]
+                except Exception:
+                    current_dd = date_opts[0]
+                if current_dd not in date_opts:
+                    date_opts = [current_dd] + date_opts
+                edit_dd = e3.selectbox("Delivery date", date_opts, index=date_opts.index(current_dd), format_func=format_delivery_date, key=f"edit_dd_{row['id']}")
+                time_opts = delivery_time_options()
+                try:
+                    raw_time = str(row.get("delivery_time") or "")[:5]
+                    current_dt = datetime.strptime(raw_time, "%H:%M").time() if raw_time else time_opts[0]
+                except Exception:
+                    current_dt = time_opts[0]
+                if current_dt not in time_opts:
+                    time_opts = [current_dt] + time_opts
+                edit_dt = e4.selectbox("Delivery time", time_opts, index=time_opts.index(current_dt), format_func=format_delivery_time, key=f"edit_dt_{row['id']}")
+                e5.write(""); e5.write("")
+                if e5.button("Save details", type="primary", use_container_width=True, key=f"save_details_{row['id']}"):
+                    try:
+                        update_order_details(int(row["id"]), edit_customer, edit_code, edit_dd, edit_dt)
+                        st.success("Customer and delivery details updated."); st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not update details: {exc}")
                 st.markdown("#### Order workflow")
                 statuses = ["New","Confirmed","Preparing","Ready","Delivered","Cancelled"]
                 current_status = str(row.get("order_status") or "New")
-                assigned = str(row.get("assigned_to") or "")
-                assign_opts = [""] + managers
-                if assigned and assigned not in assign_opts: assign_opts.append(assigned)
-                w1,w2,w3 = st.columns([1.5,1.5,1])
+                w1,w2 = st.columns([2.2,1])
                 status = w1.selectbox("Order status", statuses, index=statuses.index(current_status) if current_status in statuses else 0, key=f"status_{row['id']}")
-                assignee = w2.selectbox("Assigned to", assign_opts, index=assign_opts.index(assigned) if assigned in assign_opts else 0, key=f"assign_{row['id']}")
-                w3.write(""); w3.write("")
-                if w3.button("Save status", type="primary", use_container_width=True, key=f"save_status_{row['id']}"):
+                w2.write(""); w2.write("")
+                if w2.button("Save status", type="primary", use_container_width=True, key=f"save_status_{row['id']}"):
                     try:
-                        update_order_workflow(int(row["id"]), status, assignee or None); load_recent_orders.clear(); st.success("Order updated."); st.rerun()
+                        update_order_workflow(int(row["id"]), status); load_recent_orders.clear(); st.success("Order updated."); st.rerun()
                     except Exception as exc: st.error(f"Could not update order: {exc}")
                 st.markdown("#### Payment")
                 methods = ["Cash","Zelle","Card","Venmo","Other"]
@@ -1164,11 +1332,21 @@ with manager_tab:
                     except Exception as exc: st.error(f"Could not update payment: {exc}")
                 try:
                     old = fetch_order_for_pdf(int(row["id"])); pdf = build_invoice_pdf(old)
-                    dl_col, print_col = st.columns(2)
-                    with dl_col:
-                        st.download_button("Download selected invoice", data=pdf, file_name=f"{chosen}.pdf", mime="application/pdf", use_container_width=True)
+                    st.markdown("#### Invoice")
+                    if "invoice_preview_order_id" not in st.session_state:
+                        st.session_state.invoice_preview_order_id = None
+                    view_col, print_col, dl_col = st.columns(3)
+                    with view_col:
+                        if st.button("👁️ View invoice", use_container_width=True, key=f"view_invoice_{row['id']}"):
+                            st.session_state.invoice_preview_order_id = None if st.session_state.invoice_preview_order_id == int(row["id"]) else int(row["id"])
+                            st.rerun()
                     with print_col:
-                        render_print_button(old)
+                        render_print_button(old, label="🖨️ Print invoice")
+                    with dl_col:
+                        st.download_button("⬇️ Download invoice", data=pdf, file_name=invoice_filename(old), mime="application/pdf", use_container_width=True)
+                    if st.session_state.invoice_preview_order_id == int(row["id"]):
+                        st.caption("Invoice preview")
+                        components.html(build_invoice_print_html(old), height=650, scrolling=True)
                 except Exception as exc: st.warning(f"Could not prepare invoice: {exc}")
 
         with menu_tab:
@@ -1242,6 +1420,19 @@ with manager_tab:
                                     st.rerun()
                                 except Exception as exc:
                                     st.error(f"Could not update announcement: {exc}")
+
+        with settings_tab:
+            st.subheader("Kitchen settings")
+            st.caption("The kitchen address is printed on every invoice.")
+            current_settings = load_store_settings()
+            kitchen_addr = st.text_area("Kitchen address", value=current_settings.get("kitchen_address", ""), height=90, placeholder="Street, city, state, ZIP")
+            if st.button("Save kitchen address", type="primary", use_container_width=True):
+                try:
+                    save_store_setting("kitchen_address", kitchen_addr)
+                    st.success("Kitchen address saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save kitchen address: {exc}")
 
 
 st.divider()

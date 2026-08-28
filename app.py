@@ -6,9 +6,11 @@ from html import escape
 from io import BytesIO
 from zoneinfo import ZoneInfo
 import os
+import json
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import LETTER
@@ -311,55 +313,367 @@ def local_datetime(value: str | datetime) -> datetime:
 
 
 def build_invoice_pdf(order: dict) -> bytes:
+    """Create a compact, invoice-style PDF with minimal unused page space."""
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=LETTER, rightMargin=.6*inch, leftMargin=.6*inch,
-                            topMargin=.55*inch, bottomMargin=.55*inch,
-                            title=f"Invoice {order['invoice_number']}", author=BUSINESS_NAME)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("InvoiceTitle", parent=styles["Title"], fontSize=18, leading=22,
-                                 alignment=TA_CENTER, spaceAfter=6)
-    right_style = ParagraphStyle("Right", parent=styles["BodyText"], alignment=TA_RIGHT, fontSize=9, leading=12)
-    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, leading=12)
-    story = [Paragraph(escape(BUSINESS_NAME), title_style)]
-    contact = " | ".join(x for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
+
+    # A5-like width is easy to read on phones and prints neatly.  The height is
+    # calculated from the rendered content below, so a short order does not
+    # create a mostly blank Letter-size page.
+    page_width = 5.8 * inch
+    side_margin = 0.28 * inch
+    top_margin = 0.24 * inch
+    bottom_margin = 0.24 * inch
+    usable_width = page_width - (2 * side_margin)
+
+    body = ParagraphStyle(
+        "CompactBody", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=8.2, leading=10.2, spaceAfter=0,
+    )
+    small = ParagraphStyle(
+        "CompactSmall", parent=body, fontSize=7.4, leading=9,
+        textColor=colors.HexColor("#4A4A4A"),
+    )
+    micro = ParagraphStyle(
+        "CompactMicro", parent=body, fontSize=6.8, leading=8.2,
+        textColor=colors.HexColor("#666666"),
+    )
+    business_style = ParagraphStyle(
+        "CompactBusiness", parent=body, fontName="Helvetica-Bold",
+        fontSize=14, leading=16,
+    )
+    invoice_style = ParagraphStyle(
+        "CompactInvoice", parent=body, fontName="Helvetica-Bold",
+        fontSize=11, leading=13, alignment=TA_RIGHT,
+    )
+    right_small = ParagraphStyle(
+        "CompactRight", parent=small, alignment=TA_RIGHT,
+    )
+    total_style = ParagraphStyle(
+        "CompactTotal", parent=body, fontName="Helvetica-Bold",
+        fontSize=10, leading=12, alignment=TA_RIGHT,
+    )
+
+    story = []
+
+    # Header: business identity on the left, invoice identity on the right.
+    contact = "<br/>".join(escape(x) for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
+    business_block = escape(BUSINESS_NAME)
     if contact:
-        story.append(Paragraph(escape(contact), ParagraphStyle("Contact", parent=small, alignment=TA_CENTER)))
-    story += [Spacer(1, .18*inch), Paragraph("INVOICE", styles["Heading2"])]
-    left = [f"<b>Invoice:</b> {escape(str(order['invoice_number']))}",
-            f"<b>Date:</b> {escape(str(order['date']))}",
-            f"<b>Source:</b> {escape(str(order.get('order_source') or 'Staff'))}",
-            f"<b>Taken by:</b> {escape(str(order.get('order_taker') or '-'))}"]
-    right = [f"<b>Customer:</b> {escape(str(order.get('customer') or '-'))}",
-             f"<b>Phone:</b> {escape(str(order.get('phone') or '-'))}",
-             f"<b>Address:</b> {escape(str(order.get('address') or '-'))}"]
-    meta = Table([[Paragraph("<br/>".join(left), small), Paragraph("<br/>".join(right), right_style)]],
-                 colWidths=[3.6*inch, 3.2*inch])
-    meta.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP")]))
-    story += [meta, Spacer(1, .2*inch)]
-    rows = [["Item", "Qty", "Unit Price", "Amount"]]
-    for item in order["items"]:
-        rows.append([escape(str(item["dish"])), str(item.get("quantity_label") or item["qty"]),
-                     money(item["price"]), money(item["line_total"])])
-    table = Table(rows, colWidths=[3.55*inch,.9*inch,1.05*inch,1.3*inch], repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EEEEEE")), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("ALIGN", (1,0), (-1,-1), "RIGHT"), ("GRID", (0,0), (-1,-1), .5, colors.HexColor("#BBBBBB")),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)
+        business_block += f"<br/><font size='7' color='#666666'>{contact}</font>"
+    invoice_block = (
+        f"INVOICE<br/>"
+        f"<font size='8'>#{escape(str(order['invoice_number']))}</font><br/>"
+        f"<font size='7' color='#666666'>{escape(str(order['date']))}</font>"
+    )
+    header = Table(
+        [[Paragraph(business_block, business_style), Paragraph(invoice_block, invoice_style)]],
+        colWidths=[usable_width * 0.58, usable_width * 0.42],
+    )
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
     ]))
-    story += [table, Spacer(1,.18*inch)]
-    totals = [["Subtotal", money(order["subtotal"])], ["Delivery", money(order["delivery_fee"])],
-              ["Discount", f"-{money(order['discount'])}"],
-              [f"Tax ({float(order['tax_percent']):.2f}%)", money(order["tax_amount"])], ["TOTAL", money(order["total"])]]
-    tt = Table(totals, colWidths=[5.4*inch,1.4*inch], hAlign="RIGHT")
-    tt.setStyle(TableStyle([("ALIGN", (0,0), (-1,-1), "RIGHT"), ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"),
-                            ("LINEABOVE", (0,-1), (-1,-1), 1, colors.black), ("TOPPADDING", (0,0), (-1,-1), 4),
-                            ("BOTTOMPADDING", (0,0), (-1,-1), 4)]))
-    story.append(tt)
+    story.extend([header, Spacer(1, 5)])
+
+    # Customer / order details.  Keep this deliberately compact and omit empty
+    # fields so the invoice never wastes vertical space.
+    customer_lines = []
+    if order.get("customer"):
+        customer_lines.append(f"<b>Bill to:</b> {escape(str(order['customer']))}")
+    if order.get("phone"):
+        customer_lines.append(escape(str(order["phone"])))
+    if order.get("address"):
+        customer_lines.append(escape(str(order["address"])))
+
+    order_lines = []
+    if order.get("order_source"):
+        order_lines.append(f"<b>Source:</b> {escape(str(order['order_source']))}")
+    if order.get("order_taker"):
+        order_lines.append(f"<b>Taken by:</b> {escape(str(order['order_taker']))}")
+
+    if customer_lines or order_lines:
+        details = Table(
+            [[Paragraph("<br/>".join(customer_lines) or " ", small),
+              Paragraph("<br/>".join(order_lines) or " ", right_small)]],
+            colWidths=[usable_width * 0.62, usable_width * 0.38],
+        )
+        details.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 1),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.extend([details, Spacer(1, 3)])
+
+    # Itemized charges: typical invoice styling with a light header and only
+    # horizontal separators instead of a heavy full grid.
+    rows = [["Item", "Qty", "Unit", "Amount"]]
+    for item in order["items"]:
+        rows.append([
+            Paragraph(escape(str(item["dish"])), body),
+            Paragraph(escape(str(item.get("quantity_label") or item["qty"])), right_small),
+            Paragraph(money(item["price"]), right_small),
+            Paragraph(money(item["line_total"]), right_small),
+        ])
+
+    item_table = Table(
+        rows,
+        colWidths=[usable_width * 0.46, usable_width * 0.17,
+                   usable_width * 0.17, usable_width * 0.20],
+        repeatRows=1,
+    )
+    item_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F0F0")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#333333")),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.HexColor("#BDBDBD")),
+    ]
+    for row_no in range(1, len(rows)):
+        item_style.append(("LINEBELOW", (0, row_no), (-1, row_no), 0.25, colors.HexColor("#E4E4E4")))
+    item_table.setStyle(TableStyle(item_style))
+    story.extend([item_table, Spacer(1, 5)])
+
+    # Only show non-zero adjustments.  This keeps ordinary invoices very short.
+    totals = [["Subtotal", money(order["subtotal"])]]
+    if float(order.get("delivery_fee") or 0):
+        totals.append(["Delivery", money(order["delivery_fee"])])
+    if float(order.get("discount") or 0):
+        totals.append(["Discount", f"-{money(order['discount'])}"])
+    if float(order.get("tax_amount") or 0) or float(order.get("tax_percent") or 0):
+        totals.append([f"Tax ({float(order['tax_percent']):.2f}%)", money(order["tax_amount"])])
+    totals.append(["TOTAL", money(order["total"])])
+
+    total_rows = []
+    for idx, (label, value) in enumerate(totals):
+        is_total = idx == len(totals) - 1
+        total_rows.append([
+            Paragraph(escape(str(label)), total_style if is_total else right_small),
+            Paragraph(escape(str(value)), total_style if is_total else right_small),
+        ])
+    totals_table = Table(total_rows, colWidths=[usable_width * 0.78, usable_width * 0.22], hAlign="RIGHT")
+    totals_style = [
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.HexColor("#666666")),
+    ]
+    totals_table.setStyle(TableStyle(totals_style))
+    story.append(totals_table)
+
     if order.get("notes"):
-        story += [Spacer(1,.2*inch), Paragraph("<b>Notes</b>", small), Paragraph(escape(str(order["notes"])), small)]
-    story += [Spacer(1,.28*inch), Paragraph("Thank you for your order!", ParagraphStyle("Thanks", parent=small, alignment=TA_CENTER))]
+        story.extend([
+            Spacer(1, 5),
+            Paragraph(f"<b>Notes:</b> {escape(str(order['notes']))}", small),
+        ])
+
+    story.extend([
+        Spacer(1, 7),
+        Paragraph("Thank you for your order!", ParagraphStyle(
+            "CompactThanks", parent=micro, alignment=TA_CENTER,
+        )),
+    ])
+
+    # Measure the completed flowables at their actual available width.  Platypus
+    # normally lays them on a fixed-size page; this pass lets us size the page to
+    # the content instead.  Very large orders are capped at Letter height and
+    # can naturally continue to a second page.
+    measured_height = 0.0
+    for flowable in story:
+        try:
+            _, h = flowable.wrap(usable_width, 10000)
+            before = flowable.getSpaceBefore() if hasattr(flowable, "getSpaceBefore") else 0
+            after = flowable.getSpaceAfter() if hasattr(flowable, "getSpaceAfter") else 0
+            measured_height += h + before + after
+        except Exception:
+            measured_height += 12
+
+    page_height = measured_height + top_margin + bottom_margin + 10
+    page_height = max(4.2 * inch, min(page_height, 11 * inch))
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=(page_width, page_height),
+        rightMargin=side_margin,
+        leftMargin=side_margin,
+        topMargin=top_margin,
+        bottomMargin=bottom_margin,
+        title=f"Invoice {order['invoice_number']}",
+        author=BUSINESS_NAME,
+    )
     doc.build(story)
     return buffer.getvalue()
+
+
+
+def build_invoice_print_html(order: dict) -> str:
+    """Build a compact, print-friendly HTML invoice for direct browser printing."""
+    items_html = "".join(
+        f"""
+        <tr>
+          <td>{escape(str(item['dish']))}</td>
+          <td class="num">{escape(str(item.get('quantity_label') or item['qty']))}</td>
+          <td class="num">{escape(money(item['price']))}</td>
+          <td class="num">{escape(money(item['line_total']))}</td>
+        </tr>
+        """
+        for item in order["items"]
+    )
+
+    adjustments = ""
+    if float(order.get("delivery_fee") or 0):
+        adjustments += f'<div><span>Delivery</span><span>{escape(money(order["delivery_fee"]))}</span></div>'
+    if float(order.get("discount") or 0):
+        adjustments += f'<div><span>Discount</span><span>−{escape(money(order["discount"]))}</span></div>'
+    if float(order.get("tax_amount") or 0):
+        tax_label = f'Tax ({float(order.get("tax_percent") or 0):g}%)'
+        adjustments += f'<div><span>{escape(tax_label)}</span><span>{escape(money(order["tax_amount"]))}</span></div>'
+
+    customer_bits = []
+    if order.get("customer"):
+        customer_bits.append(f'<strong>{escape(str(order["customer"]))}</strong>')
+    if order.get("phone"):
+        customer_bits.append(escape(str(order["phone"])))
+    if order.get("address"):
+        customer_bits.append(escape(str(order["address"])))
+    customer_html = "<br>".join(customer_bits)
+
+    source_bits = []
+    if order.get("order_source"):
+        source_bits.append(f'Source: {escape(str(order["order_source"]))}')
+    if order.get("order_taker"):
+        source_bits.append(f'Taken by: {escape(str(order["order_taker"]))}')
+    source_html = "<br>".join(source_bits)
+
+    contact = "<br>".join(escape(x) for x in [BUSINESS_ADDRESS, BUSINESS_PHONE] if x)
+    notes_html = ""
+    if order.get("notes"):
+        notes_html = f'<div class="notes"><strong>Notes:</strong> {escape(str(order["notes"]))}</div>'
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Invoice {escape(str(order['invoice_number']))}</title>
+<style>
+  @page {{ margin: 8mm; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    color: #111; background: #fff; margin: 0; padding: 0;
+    font-size: 11px; line-height: 1.35;
+  }}
+  .invoice {{ width: 135mm; max-width: 100%; margin: 0 auto; }}
+  .header {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }}
+  .business {{ font-size:18px; font-weight:700; }}
+  .muted {{ color:#666; font-size:10px; }}
+  .invoice-id {{ text-align:right; }}
+  .invoice-id .label {{ font-size:15px; font-weight:700; letter-spacing:.04em; }}
+  .divider {{ border-top:1px solid #bbb; margin:8px 0; }}
+  .details {{ display:flex; justify-content:space-between; gap:14px; }}
+  .details > div:last-child {{ text-align:right; }}
+  table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
+  th {{ background:#f2f2f2; font-weight:700; border-bottom:1px solid #aaa; }}
+  th, td {{ padding:5px 4px; text-align:left; vertical-align:top; }}
+  td {{ border-bottom:1px solid #e2e2e2; }}
+  .num {{ text-align:right; white-space:nowrap; }}
+  .totals {{ width:48%; margin:8px 0 0 auto; }}
+  .totals div {{ display:flex; justify-content:space-between; padding:2px 0; }}
+  .totals .grand {{ border-top:1px solid #777; margin-top:3px; padding-top:5px; font-size:14px; font-weight:700; }}
+  .notes {{ margin-top:8px; font-size:10px; }}
+  .footer {{ margin-top:9px; text-align:center; color:#666; font-size:9px; }}
+  @media print {{
+    .invoice {{ width:100%; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="invoice">
+    <div class="header">
+      <div>
+        <div class="business">{escape(BUSINESS_NAME)}</div>
+        <div class="muted">{contact}</div>
+      </div>
+      <div class="invoice-id">
+        <div class="label">INVOICE</div>
+        <div>#{escape(str(order['invoice_number']))}</div>
+        <div class="muted">{escape(str(order['date']))}</div>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="details">
+      <div>{customer_html}</div>
+      <div class="muted">{source_html}</div>
+    </div>
+    <table>
+      <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Amount</th></tr></thead>
+      <tbody>{items_html}</tbody>
+    </table>
+    <div class="totals">
+      <div><span>Subtotal</span><span>{escape(money(order['subtotal']))}</span></div>
+      {adjustments}
+      <div class="grand"><span>Total</span><span>{escape(money(order['total']))}</span></div>
+    </div>
+    {notes_html}
+    <div class="footer">Thank you for your order.</div>
+  </div>
+</body>
+</html>"""
+
+
+def render_print_button(order: dict, label: str = "🖨️ Print invoice") -> None:
+    """Render a browser-native print button without downloading the PDF first."""
+    printable = build_invoice_print_html(order)
+    payload = json.dumps(printable)
+    button_label = json.dumps(label)
+    components.html(
+        f"""
+        <div style="margin:0;padding:0;color-scheme:light dark;">
+          <button id="printInvoice" type="button" style="
+            width:100%; min-height:40px; border-radius:8px;
+            border:1px solid GrayText; background:transparent; color:CanvasText;
+            font:600 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            cursor:pointer; padding:8px 12px;">
+          </button>
+          <div id="printMessage" style="font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:GrayText;margin-top:4px;"></div>
+        </div>
+        <script>
+          const btn = document.getElementById('printInvoice');
+          const msg = document.getElementById('printMessage');
+          btn.textContent = {button_label};
+          const invoiceHtml = {payload};
+          btn.addEventListener('click', () => {{
+            const w = window.open('', '_blank');
+            if (!w) {{
+              msg.textContent = 'Allow pop-ups for this site to print directly.';
+              return;
+            }}
+            w.document.open();
+            w.document.write(invoiceHtml);
+            w.document.close();
+            w.focus();
+            setTimeout(() => {{
+              try {{ w.print(); }} catch (e) {{ msg.textContent = 'Could not open the print dialog.'; }}
+            }}, 250);
+          }});
+        </script>
+        """,
+        height=48,
+        scrolling=False,
+    )
 
 
 def fetch_order_for_pdf(order_id: int) -> dict:
@@ -780,14 +1094,20 @@ with manager_tab:
                         try:
                             created = create_staff_order(order_taker, customer, phone, address, notes, st.session_state.staff_cart, delivery, discount, tax)
                             order = fetch_order_for_pdf(int(created["order_id"]))
-                            st.session_state.staff_invoice = {"number": order["invoice_number"], "pdf": build_invoice_pdf(order)}
+                            st.session_state.staff_invoice = {"number": order["invoice_number"], "pdf": build_invoice_pdf(order), "order": order}
                             st.session_state.staff_cart = []; load_recent_orders.clear(); st.rerun()
                         except Exception as exc:
                             st.error(f"Could not save order: {exc}")
                 if st.session_state.staff_invoice:
                     inv = st.session_state.staff_invoice
                     st.success(f"Invoice {inv['number']} saved.")
-                    st.download_button("Download PDF invoice", data=inv["pdf"], file_name=f"{inv['number']}.pdf", mime="application/pdf", use_container_width=True)
+                    dl_col, print_col = st.columns(2)
+                    with dl_col:
+                        st.download_button("Download PDF invoice", data=inv["pdf"], file_name=f"{inv['number']}.pdf", mime="application/pdf", use_container_width=True)
+                    with print_col:
+                        if inv.get("order"):
+                            render_print_button(inv["order"])
+
 
         with history_tab:
             h1,h2 = st.columns([3,1]); h1.subheader("Recent orders")
@@ -841,7 +1161,11 @@ with manager_tab:
                     except Exception as exc: st.error(f"Could not update payment: {exc}")
                 try:
                     old = fetch_order_for_pdf(int(row["id"])); pdf = build_invoice_pdf(old)
-                    st.download_button("Download selected invoice", data=pdf, file_name=f"{chosen}.pdf", mime="application/pdf", use_container_width=True)
+                    dl_col, print_col = st.columns(2)
+                    with dl_col:
+                        st.download_button("Download selected invoice", data=pdf, file_name=f"{chosen}.pdf", mime="application/pdf", use_container_width=True)
+                    with print_col:
+                        render_print_button(old)
                 except Exception as exc: st.warning(f"Could not prepare invoice: {exc}")
 
         with menu_tab:

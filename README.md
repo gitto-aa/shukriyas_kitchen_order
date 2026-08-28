@@ -1,12 +1,13 @@
-# Shukriya's Kitchen Orders v19
+# Shukriya's Kitchen Order App - v20
 
-Adds customer announcements to the v18 ordering system.
+This version keeps the existing public ordering, manager dashboard, announcements, payment tracking, and notifications, and redesigns generated PDF invoices to be compact.
 
-## New in v19
-- Manager `Announcements` tab.
-- Publish an announcement with title, message, style, and active/hidden status.
-- Styles: Info, Important, Warning, Success.
-- Edit or hide previous announcements.
-- Active announcements appear at the top of the public Menu & Order page.
+## v20 invoice changes
+- A5-like invoice width instead of full US Letter width.
+- Page height automatically shrinks to fit the invoice content for small orders.
+- Compact business/customer header.
+- Clean itemized invoice table with minimal grid lines.
+- Zero-value delivery, discount, and tax rows are hidden.
+- Larger orders can still continue onto additional pages when needed.
 
-The Supabase `announcements` table is required. If this package came from the configured project session, that migration has already been applied.
+No Supabase migration is required for v20. Replace `app.py` (or deploy the full project) and restart the Streamlit app.

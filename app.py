@@ -281,11 +281,34 @@ st.caption("Browse the menu and place an order online, or sign in to the manager
 public_tab, manager_tab = st.tabs(["🍽️ Menu & Order", "🔐 Manager"])
 
 with public_tab:
-    st.subheader("Menu")
     if public_menu.empty:
         st.info("The online menu is not available yet.")
     else:
         categories = sorted(public_menu["category"].unique().tolist(), key=str.casefold)
+
+        st.subheader("Browse menu")
+        st.caption("Browse all currently available dishes and prices before placing your order.")
+        for menu_category in categories:
+            category_df = public_menu[public_menu["category"] == menu_category].copy()
+            with st.expander(str(menu_category), expanded=str(menu_category).strip().casefold() == "main"):
+                for menu_dish in sorted(category_df["dish"].unique().tolist(), key=str.casefold):
+                    dish_options = category_df[category_df["dish"] == menu_dish].sort_values(["sort_order", "price"])
+                    st.markdown(f"**{menu_dish}**")
+                    if len(dish_options) == 1 and str(dish_options.iloc[0]["option"]).strip().casefold() == "standard":
+                        price_text = money(float(dish_options.iloc[0]["price"]))
+                        if str(menu_category).strip().casefold() == "main":
+                            price_text += " / tray"
+                        st.write(price_text)
+                    else:
+                        for _, menu_option in dish_options.iterrows():
+                            label = str(menu_option["option"])
+                            price_text = money(float(menu_option["price"]))
+                            if str(menu_category).strip().casefold() == "main" and label.strip().casefold() == "standard":
+                                price_text += " / tray"
+                            st.write(f"{label} — {price_text}")
+                    st.divider()
+
+        st.subheader("Build your order")
         category = st.selectbox("Category", categories, key="public_category")
         cat_df = public_menu[public_menu["category"] == category].copy()
         dishes = sorted(cat_df["dish"].unique().tolist(), key=str.casefold)

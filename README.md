@@ -117,3 +117,7 @@ This is safer than trusting the price displayed earlier in a user's browser sess
 - Order/payment statuses are stored but are not yet editable from the Streamlit interface.
 
 Good next upgrades would be individual logins, an in-app menu editor for administrators, status buttons (`New → Cooking → Ready → Delivered`), payment status updates, and daily/monthly sales dashboards.
+
+
+## v10 update
+The public customer page now includes a browsable menu grouped by category, showing all available dishes, options, and prices before the order builder.

@@ -18,7 +18,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from supabase import Client, create_client
 
 
-st.set_page_config(page_title="Shukirya's Kitchen", page_icon="🍽️", layout="centered")
+st.set_page_config(page_title="Home Kitchen Orders", page_icon="🍽️", layout="centered")
 
 
 def setting(name: str, default: str = "") -> str:
@@ -52,7 +52,7 @@ def first_secret(*names: str) -> str:
     return ""
 
 
-BUSINESS_NAME = setting("BUSINESS_NAME", "Shukiyra's Kitchen")
+BUSINESS_NAME = setting("BUSINESS_NAME", "My Home Kitchen")
 BUSINESS_PHONE = setting("BUSINESS_PHONE", "")
 BUSINESS_ADDRESS = setting("BUSINESS_ADDRESS", "")
 CURRENCY = setting("CURRENCY", "$")
@@ -360,7 +360,7 @@ def require_password() -> None:
     if st.session_state.get("app_authenticated"):
         return
 
-    st.title("🍽️ Shukirya's Kitchen")
+    st.title("🍽️ Home Kitchen Orders")
     st.caption("Enter the shared app password to continue.")
     entered = st.text_input("App password", type="password")
     if st.button("Sign in", type="primary"):
@@ -431,18 +431,45 @@ with new_order_tab:
                 notes = st.text_area("Order notes", height=68, key="notes")
 
         st.subheader("Add dishes")
-        left, right = st.columns([3, 1])
-        with left:
+
+        categories = sorted(
+            menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(),
+            key=str.casefold,
+        )
+        category_col, dish_col, qty_col = st.columns([2, 3, 1.4])
+
+        with category_col:
+            selected_category = st.selectbox(
+                "Category",
+                options=categories,
+                key="selected_category",
+            )
+
+        category_menu = menu[
+            menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu")
+            == selected_category
+        ].copy()
+
+        with dish_col:
             selected_id = st.selectbox(
                 "Dish",
-                options=menu["id"].astype(int).tolist(),
-                format_func=lambda item_id: menu.loc[menu["id"] == item_id, "dish"].iloc[0],
+                options=category_menu["id"].astype(int).tolist(),
+                format_func=lambda item_id: category_menu.loc[
+                    category_menu["id"] == item_id, "dish"
+                ].iloc[0],
+                key=f"dish_for_{selected_category}",
             )
-        with right:
-            qty_text = st.text_input("Quantity", value="1", help="Examples: 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays")
 
-        selected = menu.loc[menu["id"] == selected_id].iloc[0]
-        st.caption(f"{selected['category']} · {money(float(selected['price']))} per base unit/tray")
+        with qty_col:
+            qty_text = st.text_input(
+                "Quantity",
+                value="1",
+                help="Examples: 2, 1/2, 1 tray, 1/2 tray, 1 1/2 trays",
+                key="quantity_input",
+            )
+
+        selected = category_menu.loc[category_menu["id"] == selected_id].iloc[0]
+        st.caption(f"{money(float(selected['price']))} per base unit/tray")
 
         if st.button("Add to order", type="primary", use_container_width=True):
             try:

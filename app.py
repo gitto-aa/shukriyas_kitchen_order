@@ -299,7 +299,7 @@ with public_tab:
                         label = str(menu_option["option"]).strip()
                         price_text = money(float(menu_option["price"]))
                         if label.casefold() == "standard":
-                            if str(menu_category).strip().casefold() == "main":
+                            if str(menu_category).strip().casefold() in {"main", "side"}:
                                 option_parts.append(f"{escape(price_text)} / tray")
                             else:
                                 option_parts.append(escape(price_text))
@@ -327,7 +327,7 @@ with public_tab:
         qcol, acol = st.columns([1,2])
         selected = dish_df.loc[dish_df["option_id"] == option_id].iloc[0]
         with qcol:
-            if str(category).strip().casefold() == "main":
+            if str(category).strip().casefold() in {"main", "side"}:
                 qty = float(st.number_input(
                     "Tray quantity",
                     min_value=0.5,
@@ -349,8 +349,9 @@ with public_tab:
             st.write("")
             if st.button("Add to cart", type="primary", use_container_width=True):
                 st.session_state.public_cart.append({"option_id": int(option_id), "dish": dish,
-                    "option": str(selected["option"]), "qty": float(qty), "quantity_label": quantity_label,
-                    "price": float(selected["price"]), "line_total": float(qty)*float(selected["price"])})
+                    "category": str(category), "option": str(selected["option"]), "qty": float(qty),
+                    "quantity_label": quantity_label, "price": float(selected["price"]),
+                    "line_total": float(qty) * float(selected["price"])})
                 st.session_state.public_confirmation = None
                 st.rerun()
 
@@ -358,15 +359,71 @@ with public_tab:
         if not st.session_state.public_cart:
             st.info("Your cart is empty.")
         else:
-            for i, item in enumerate(st.session_state.public_cart):
-                c1,c2,c3,c4 = st.columns([3.5,1.2,1.4,.7])
-                c1.write(f"**{item['dish']}**  \n{item['option']}")
-                c2.write(f"× {item.get('quantity_label') or item['qty']}")
-                c3.write(money(item["line_total"]))
-                if c4.button("✕", key=f"public_remove_{i}"):
-                    st.session_state.public_cart.pop(i); st.rerun()
+            # Compact cart table with quantity controls.
+            header = st.columns([3.4, 2.6, 1.5, 1.5, 0.7])
+            header[0].markdown("**Item**")
+            header[1].markdown("**Qty**")
+            header[2].markdown("**Unit**")
+            header[3].markdown("**Total**")
+            header[4].markdown("**Remove**")
+
+            for idx, item in enumerate(st.session_state.public_cart):
+                option = str(item.get("option") or "").strip()
+                item_name = str(item["dish"])
+                if option and option.casefold() != "standard":
+                    item_name = f"{item_name} — {option}"
+
+                category_name = str(item.get("category") or "").strip().casefold()
+                is_tray = category_name in {"main", "side"}
+                step = 0.5 if is_tray else 1.0
+                minimum = 0.5 if is_tray else 1.0
+                qty_value = float(item.get("qty", minimum))
+
+                row = st.columns([3.4, 2.6, 1.5, 1.5, 0.7], vertical_alignment="center")
+                row[0].markdown(item_name)
+
+                with row[1]:
+                    minus_col, qty_col, plus_col = st.columns([1, 1.5, 1])
+                    if minus_col.button("−", key=f"cart_minus_{idx}",
+                                        disabled=qty_value <= minimum + 1e-9,
+                                        use_container_width=True):
+                        new_qty = max(minimum, qty_value - step)
+                        item["qty"] = new_qty
+                        if is_tray:
+                            qtxt = f"{new_qty:g}"
+                            item["quantity_label"] = f"{qtxt} tray" if abs(new_qty - 1.0) < 1e-9 else f"{qtxt} trays"
+                        else:
+                            item["quantity_label"] = str(int(round(new_qty)))
+                        item["line_total"] = new_qty * float(item["price"])
+                        st.rerun()
+                    display_qty = str(item.get("quantity_label") or f"{qty_value:g}")
+                    qty_col.markdown(
+                        f"<div style='text-align:center; white-space:nowrap; padding-top:0.45rem;'>{display_qty}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if plus_col.button("+", key=f"cart_plus_{idx}", use_container_width=True):
+                        new_qty = qty_value + step
+                        item["qty"] = new_qty
+                        if is_tray:
+                            qtxt = f"{new_qty:g}"
+                            item["quantity_label"] = f"{qtxt} tray" if abs(new_qty - 1.0) < 1e-9 else f"{qtxt} trays"
+                        else:
+                            item["quantity_label"] = str(int(round(new_qty)))
+                        item["line_total"] = new_qty * float(item["price"])
+                        st.rerun()
+
+                row[2].markdown(money(float(item["price"])))
+                row[3].markdown(f"**{money(float(item['line_total']))}**")
+                if row[4].button("×", key=f"cart_remove_{idx}", help="Remove item", use_container_width=True):
+                    st.session_state.public_cart.pop(idx)
+                    st.rerun()
+
+                st.markdown("<hr style='margin:0.25rem 0 0.45rem 0; opacity:0.22;'>", unsafe_allow_html=True)
+
             subtotal = sum(i["line_total"] for i in st.session_state.public_cart)
-            st.markdown(f"### Total: {money(subtotal)}")
+            total_left, total_right = st.columns([3, 2])
+            total_left.markdown("**Cart total**")
+            total_right.markdown(f"### {money(subtotal)}")
             st.caption("Final price is verified against the live menu when you submit.")
             st.markdown("### Your details")
             pc1, pc2 = st.columns(2)

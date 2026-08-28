@@ -18,7 +18,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from supabase import Client, create_client
 
 
-st.set_page_config(page_title="Shukriya's Kitchen", page_icon="🍽️", layout="centered")
+st.set_page_config(page_title="Home Kitchen Orders", page_icon="🍽️", layout="centered")
 
 
 def setting(name: str, default: str = "") -> str:
@@ -94,13 +94,26 @@ def load_menu() -> pd.DataFrame:
     return df.dropna(subset=["price"]).reset_index(drop=True)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_managers() -> list[str]:
+    response = (
+        get_db()
+        .table("managers")
+        .select("name,active")
+        .eq("active", True)
+        .order("name")
+        .execute()
+    )
+    return [str(row["name"]) for row in (response.data or [])]
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def load_recent_orders(limit: int = 50) -> pd.DataFrame:
     response = (
         get_db()
         .table("orders")
         .select(
-            "id,invoice_number,created_at,order_taker,customer,phone,total,payment_status,order_status"
+            "id,invoice_number,created_at,order_taker,customer,phone,total,payment_status,payment_method,payment_received_by,paid_at,order_status"
         )
         .order("created_at", desc=True)
         .limit(limit)
@@ -354,13 +367,28 @@ def create_order(
     return response.data[0] if isinstance(response.data, list) else response.data
 
 
+
+def update_order_payment(order_id: int, payment_status: str, payment_method: str | None, received_by: str | None) -> dict:
+    response = get_db().rpc(
+        "update_order_payment",
+        {
+            "p_order_id": int(order_id),
+            "p_payment_status": payment_status,
+            "p_payment_method": payment_method,
+            "p_received_by": received_by,
+        },
+    ).execute()
+    if not response.data:
+        raise RuntimeError("Supabase did not return the updated payment record.")
+    return response.data[0] if isinstance(response.data, list) else response.data
+
 def require_password() -> None:
     if not APP_PASSWORD:
         return
     if st.session_state.get("app_authenticated"):
         return
 
-    st.title("🍽️ Shukriya's Kitchen")
+    st.title("🍽️ Home Kitchen Orders")
     st.caption("Enter the shared app password to continue.")
     entered = st.text_input("App password", type="password")
     if st.button("Sign in", type="primary"):
@@ -373,7 +401,7 @@ def require_password() -> None:
 
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    st.title("🍽️ Shukriya's Kitchen")
+    st.title("🍽️ Home Kitchen Orders")
     st.error("Supabase credentials are not being detected by this Streamlit app.")
     st.write(
         {
@@ -405,13 +433,14 @@ if "cart" not in st.session_state:
 if "generated_invoice" not in st.session_state:
     st.session_state.generated_invoice = None
 
-st.title("🍽️ Shukriya's Kitchen")
+st.title("🍽️ Home Kitchen Orders")
 st.caption("Shared menu, central order history, and PDF invoices powered by Supabase.")
 
 try:
     menu = load_menu()
+    managers = load_managers()
 except Exception as exc:
-    st.error(f"Could not connect to Supabase or load the menu: {exc}")
+    st.error(f"Could not connect to Supabase or load app data: {exc}")
     st.stop()
 
 new_order_tab, history_tab, menu_tab = st.tabs(["New order", "Order history", "Menu"])
@@ -423,7 +452,11 @@ with new_order_tab:
         with st.expander("Customer & order details", expanded=True):
             c1, c2 = st.columns(2)
             with c1:
-                order_taker = st.text_input("Order taken by", key="order_taker")
+                order_taker = st.selectbox(
+                    "Order taken by",
+                    options=managers if managers else [""],
+                    key="order_taker",
+                )
                 customer = st.text_input("Customer name", key="customer")
                 phone = st.text_input("Phone", key="phone")
             with c2:
@@ -605,18 +638,82 @@ with history_tab:
                 "phone": "Phone",
                 "total": "Total",
                 "payment_status": "Payment",
+                "payment_method": "Method",
+                "payment_received_by": "Received by",
                 "order_status": "Status",
             }
         )
+        display["Method"] = display["Method"].fillna("-")
+        display["Received by"] = display["Received by"].fillna("-")
         st.dataframe(
-            display[["Invoice", "Date", "Customer", "Total", "Payment", "Status", "Taken by"]],
+            display[["Invoice", "Date", "Customer", "Total", "Payment", "Method", "Received by", "Status", "Taken by"]],
             use_container_width=True,
             hide_index=True,
         )
 
         invoice_options = orders["invoice_number"].tolist()
-        chosen_invoice = st.selectbox("Reprint invoice", invoice_options)
+        chosen_invoice = st.selectbox("Select order", invoice_options)
         chosen_row = orders.loc[orders["invoice_number"] == chosen_invoice].iloc[0]
+
+        st.markdown("#### Update payment")
+        current_status = str(chosen_row.get("payment_status") or "Unpaid")
+        current_method = str(chosen_row.get("payment_method") or "Cash")
+        methods = ["Cash", "Zelle", "Card", "Venmo", "Other"]
+        if current_method not in methods:
+            methods.append(current_method)
+
+        current_receiver = str(chosen_row.get("payment_received_by") or (managers[0] if managers else ""))
+        if current_receiver and current_receiver not in managers:
+            managers_for_payment = managers + [current_receiver]
+        else:
+            managers_for_payment = managers
+
+        pc1, pc2, pc3, pc4 = st.columns([1.2, 1.4, 1.5, 1])
+        with pc1:
+            payment_status = st.selectbox(
+                "Payment status",
+                ["Unpaid", "Paid"],
+                index=1 if current_status == "Paid" else 0,
+                key=f"payment_status_{chosen_row['id']}",
+            )
+        with pc2:
+            payment_method = st.selectbox(
+                "Payment method",
+                methods,
+                index=methods.index(current_method) if current_method in methods else 0,
+                disabled=payment_status != "Paid",
+                key=f"payment_method_{chosen_row['id']}",
+            )
+        with pc3:
+            payment_receiver = st.selectbox(
+                "Received by",
+                managers_for_payment if managers_for_payment else [""],
+                index=(managers_for_payment.index(current_receiver) if current_receiver in managers_for_payment else 0),
+                disabled=payment_status != "Paid",
+                key=f"payment_receiver_{chosen_row['id']}",
+            )
+        with pc4:
+            st.write("")
+            st.write("")
+            if st.button("Save payment", type="primary", use_container_width=True, key=f"save_payment_{chosen_row['id']}"):
+                try:
+                    update_order_payment(
+                        int(chosen_row["id"]),
+                        payment_status,
+                        payment_method if payment_status == "Paid" else None,
+                        payment_receiver if payment_status == "Paid" else None,
+                    )
+                    load_recent_orders.clear()
+                    st.success("Payment updated.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not update payment: {exc}")
+
+        paid_at = chosen_row.get("paid_at")
+        if current_status == "Paid" and paid_at:
+            st.caption(f"Paid {local_datetime(paid_at).strftime('%b %d, %Y %I:%M %p')}")
+
+        st.markdown("#### Invoice")
         try:
             old_order = fetch_order_for_pdf(int(chosen_row["id"]))
             old_pdf = build_invoice_pdf(old_order)

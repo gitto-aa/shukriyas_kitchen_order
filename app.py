@@ -18,7 +18,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from supabase import Client, create_client
 
 
-st.set_page_config(page_title="Home Kitchen Orders", page_icon="🍽️", layout="centered")
+st.set_page_config(page_title="Shukirya's Kitchen", page_icon="🍽️", layout="centered")
 
 
 def setting(name: str, default: str = "") -> str:

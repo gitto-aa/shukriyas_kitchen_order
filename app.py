@@ -698,7 +698,7 @@ def build_invoice_pdf(order: dict) -> bytes:
     if order.get("notes"):
         story.extend([
             Spacer(1, 5),
-            Paragraph(f"<b>Notes:</b> {escape(str(order['notes']))}", small),
+            Paragraph(f"<b>ORDER NOTES: {escape(str(order['notes']))}</b>", body),
         ])
 
     story.extend([
@@ -833,7 +833,7 @@ def build_invoice_print_html(order: dict) -> str:
         delivery_html = f'<div class="delivery"><strong>DELIVERY: {escape(" | ".join(delivery_parts))}</strong></div>'
     notes_html = ""
     if order.get("notes"):
-        notes_html = f'<div class="notes"><strong>Notes:</strong> {escape(str(order["notes"]))}</div>'
+        notes_html = f'<div class="notes"><strong>ORDER NOTES: {escape(str(order["notes"]))}</strong></div>'
     payment_html = ""
     if payment["is_paid"]:
         payment_bits = ['<div><span><strong>Payment status</strong></span><span><strong>PAID</strong></span></div>']
@@ -887,7 +887,7 @@ def build_invoice_print_html(order: dict) -> str:
   .totals .grand {{ border-top:1px solid #777; margin-top:3px; padding-top:5px; font-size:14px; font-weight:700; }}
   .payment-box {{ margin:8px 0 0 auto; width:56%; border:1px solid #3f7a4d; background:#f5faf5; padding:6px 8px; font-size:10px; }}
   .payment-box div {{ display:flex; justify-content:space-between; gap:10px; padding:1px 0; }}
-  .notes {{ margin-top:8px; font-size:10px; }}
+  .notes {{ margin-top:8px; padding:6px 8px; border:1px solid #bbb; background:#f7f7f7; font-size:11px; font-weight:700; }}
   .footer {{ margin-top:9px; text-align:center; color:#666; font-size:9px; }}
   @media print {{
     .invoice {{ width:100%; }}

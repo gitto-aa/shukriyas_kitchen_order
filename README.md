@@ -1,1 +1,1 @@
-v34: category dropdowns in add/edit dish and Supabase menu save ambiguity fix.
+v35 makes order notes bold and prominent on PDF, print, and invoice preview.

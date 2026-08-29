@@ -1,1 +1,1 @@
-v37 makes menu pricing fields appear dynamically based on selected selling formats.
+v38 simplifies manager Staff order dish selection: one searchable all-dishes dropdown, with categories retained for menu management/customer display.

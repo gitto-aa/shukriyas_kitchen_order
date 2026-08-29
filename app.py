@@ -1418,14 +1418,17 @@ with manager_tab:
                 )
                 delivery_time_value = d2.selectbox("Delivery time", time_options, format_func=format_delivery_time, key="staff_delivery_time")
                 st.markdown("### Add dishes")
-                categories = sorted(menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu").unique().tolist(), key=str.casefold)
-                cc,dc = st.columns([2,3])
-                with cc: category = st.selectbox("Category", categories, key="staff_category")
-                cat = menu[menu["category"].fillna("Menu").astype(str).str.strip().replace("", "Menu") == category].copy()
-                with dc:
-                    item_id = st.selectbox("Dish", cat["id"].astype(int).tolist(),
-                        format_func=lambda iid: cat.loc[cat["id"]==iid, "dish"].iloc[0], key=f"staff_dish_{category}")
-                selected = cat.loc[cat["id"]==item_id].iloc[0]
+                # Manager-side order entry does not need category navigation.
+                # Show every available dish in one searchable dropdown; categories
+                # remain in the Menu editor and customer-facing menu.
+                staff_dishes = menu.sort_values("dish", key=lambda col: col.astype(str).str.casefold()).copy()
+                item_id = st.selectbox(
+                    "Dish",
+                    staff_dishes["id"].astype(int).tolist(),
+                    format_func=lambda iid: staff_dishes.loc[staff_dishes["id"] == iid, "dish"].iloc[0],
+                    key="staff_dish_all",
+                )
+                selected = staff_dishes.loc[staff_dishes["id"] == item_id].iloc[0]
                 item_options = public_menu[public_menu["menu_item_id"] == int(item_id)].copy().sort_values(["sort_order", "price"])
                 ids = item_options["option_id"].astype(int).tolist()
                 if not ids:

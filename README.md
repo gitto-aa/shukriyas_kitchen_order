@@ -1,1 +1,1 @@
-v40: dynamic expenditure fields, monthly total income/expense row, CSV statement export.
+v42: Manager sections in Expenditure monthly statement are collapsed by default.

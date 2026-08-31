@@ -239,6 +239,14 @@ def kitchen_address() -> str:
         return BUSINESS_ADDRESS
 
 
+def default_hourly_salary() -> float:
+    try:
+        raw = load_store_settings().get("hourly_salary", "").strip()
+        return max(0.0, float(raw)) if raw else 0.0
+    except Exception:
+        return 0.0
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def load_customers() -> pd.DataFrame:
     response = get_db().table("customers").select("id,name,normalized_name,short_code,phone").order("name").execute()
@@ -2094,7 +2102,8 @@ with manager_tab:
             if expense_category == "Salary":
                 s1, s2 = st.columns(2)
                 wage = s1.number_input(
-                    "Wage / hour", min_value=0.0, value=0.0, step=0.5, format="%.2f",
+                    "Wage / hour", min_value=0.0, value=float(default_hourly_salary()), step=0.5, format="%.2f",
+                    help="Defaults to the hourly salary saved in Settings. You can override it for this entry.",
                     key="expense_wage"
                 )
                 hours = s2.number_input(
@@ -2203,7 +2212,7 @@ with manager_tab:
             try:
                 statement = monthly_manager_statement(int(statement_year), int(statement_month), managers)
                 for mgr in statement["managers"]:
-                    with st.expander(mgr["name"], expanded=True):
+                    with st.expander(mgr["name"], expanded=False):
                         a,b,c,d,e = st.columns(5)
                         a.metric("Payments received", money(mgr["payments_total"]))
                         b.metric("Expenses", money(mgr["expenses_total"]))
@@ -2309,16 +2318,45 @@ with manager_tab:
 
         with settings_tab:
             st.subheader("Kitchen settings")
-            st.caption("The kitchen address is printed on every invoice.")
             current_settings = load_store_settings()
-            kitchen_addr = st.text_area("Kitchen address", value=current_settings.get("kitchen_address", ""), height=90, placeholder="Street, city, state, ZIP")
-            if st.button("Save kitchen address", type="primary", use_container_width=True):
+
+            st.markdown("#### Kitchen address")
+            st.caption("The kitchen address is printed on every invoice.")
+            kitchen_addr = st.text_area(
+                "Kitchen address",
+                value=current_settings.get("kitchen_address", ""),
+                height=90,
+                placeholder="Street, city, state, ZIP",
+                key="settings_kitchen_address",
+            )
+            if st.button("Save kitchen address", use_container_width=True, key="save_kitchen_address"):
                 try:
                     save_store_setting("kitchen_address", kitchen_addr)
                     st.success("Kitchen address saved.")
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not save kitchen address: {exc}")
+
+            st.markdown("#### Salary settings")
+            saved_hourly = default_hourly_salary()
+            hourly_salary = st.number_input(
+                "Default hourly salary",
+                min_value=0.0,
+                value=float(saved_hourly),
+                step=0.5,
+                format="%.2f",
+                help="This rate automatically fills Wage / hour when Salary is selected under Expenditure.",
+                key="settings_hourly_salary",
+            )
+            if st.button("Save hourly salary", type="primary", use_container_width=True, key="save_hourly_salary"):
+                try:
+                    save_store_setting("hourly_salary", f"{float(hourly_salary):.2f}")
+                    # Reset the salary-entry wage so the newly saved default is picked up next time.
+                    st.session_state.pop("expense_wage", None)
+                    st.success("Default hourly salary saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save hourly salary: {exc}")
 
 
 st.divider()

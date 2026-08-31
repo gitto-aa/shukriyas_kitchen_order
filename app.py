@@ -1053,6 +1053,177 @@ def update_order_workflow(order_id, status):
     return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def load_expenses() -> pd.DataFrame:
+    response = (
+        get_db().table("expenses")
+        .select("id,category,expense_by,expense_date,description,amount,wage_per_hour,hours,reimbursed,reimbursed_date,paid_by,created_at")
+        .order("expense_date", desc=True).order("id", desc=True).execute()
+    )
+    df = pd.DataFrame(response.data or [])
+    if df.empty:
+        return pd.DataFrame(columns=["id","category","expense_by","expense_date","description","amount","wage_per_hour","hours","reimbursed","reimbursed_date","paid_by","created_at"])
+    for col in ["amount","wage_per_hour","hours"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def save_expense(category: str, expense_by: str, expense_date_value: date, description: str,
+                 amount: float, wage_per_hour: float | None, hours: float | None,
+                 settled: bool, settled_date: date | None, paid_by: str | None) -> None:
+    payload = {
+        "category": category,
+        "expense_by": expense_by,
+        "expense_date": expense_date_value.isoformat(),
+        "description": description.strip() or None,
+        "amount": float(amount),
+        "wage_per_hour": float(wage_per_hour) if wage_per_hour is not None else None,
+        "hours": float(hours) if hours is not None else None,
+        "reimbursed": bool(settled),
+        "reimbursed_date": settled_date.isoformat() if settled and settled_date else None,
+        "paid_by": paid_by if settled else None,
+    }
+    get_db().table("expenses").insert(payload).execute()
+    load_expenses.clear()
+
+
+def settle_expense(expense_id: int, settled_date: date, paid_by: str) -> None:
+    get_db().table("expenses").update({
+        "reimbursed": True,
+        "reimbursed_date": settled_date.isoformat(),
+        "paid_by": paid_by,
+    }).eq("id", int(expense_id)).execute()
+    load_expenses.clear()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_paid_orders_for_statements() -> pd.DataFrame:
+    response = (
+        get_db().table("orders")
+        .select("id,invoice_number,customer,total,payment_method,payment_received_by,paid_at,payment_status")
+        .eq("payment_status", "Paid")
+        .order("paid_at", desc=True).execute()
+    )
+    df = pd.DataFrame(response.data or [])
+    if df.empty:
+        return pd.DataFrame(columns=["id","invoice_number","customer","total","payment_method","payment_received_by","paid_at","payment_status"])
+    df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0)
+    return df
+
+
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    return start, next_month - timedelta(days=1)
+
+
+def monthly_manager_statement(year: int, month: int, managers_list: list[str]) -> dict:
+    start, end = month_bounds(year, month)
+    expenses = load_expenses().copy()
+    orders = load_paid_orders_for_statements().copy()
+
+    if not expenses.empty:
+        expenses["expense_date_parsed"] = pd.to_datetime(expenses["expense_date"], errors="coerce").dt.date
+        expenses["reimbursed_date_parsed"] = pd.to_datetime(expenses["reimbursed_date"], errors="coerce").dt.date
+    if not orders.empty:
+        orders["paid_local"] = orders["paid_at"].apply(lambda x: local_datetime(x) if pd.notna(x) and x else None)
+        orders["paid_date"] = orders["paid_local"].apply(lambda x: x.date() if x else None)
+
+    names = list(dict.fromkeys([m for m in managers_list if m]))
+    for source_col, df in [("expense_by", expenses), ("paid_by", expenses), ("payment_received_by", orders)]:
+        if not df.empty and source_col in df.columns:
+            for name in df[source_col].dropna().astype(str):
+                if name.strip() and name.strip() not in names:
+                    names.append(name.strip())
+
+    result = {"start": start, "end": end, "managers": []}
+    for name in names:
+        if orders.empty:
+            payments = orders.copy()
+        else:
+            payments = orders[(orders["payment_received_by"].fillna("").astype(str) == name) & orders["paid_date"].apply(lambda d: d is not None and start <= d <= end)].copy()
+        if expenses.empty:
+            incurred = expenses.copy(); received = expenses.copy(); paid = expenses.copy(); outstanding = expenses.copy()
+        else:
+            incurred = expenses[(expenses["expense_by"].fillna("").astype(str) == name) & expenses["expense_date_parsed"].apply(lambda d: d is not None and start <= d <= end)].copy()
+            received = expenses[(expenses["expense_by"].fillna("").astype(str) == name) & (expenses["reimbursed"] == True) & expenses["reimbursed_date_parsed"].apply(lambda d: d is not None and start <= d <= end)].copy()
+            paid = expenses[(expenses["paid_by"].fillna("").astype(str) == name) & (expenses["reimbursed"] == True) & expenses["reimbursed_date_parsed"].apply(lambda d: d is not None and start <= d <= end)].copy()
+            outstanding = expenses[(expenses["expense_by"].fillna("").astype(str) == name) & expenses["expense_date_parsed"].apply(lambda d: d is not None and d <= end) & expenses.apply(lambda r: (not bool(r.get("reimbursed"))) or (r.get("reimbursed_date_parsed") is not None and r.get("reimbursed_date_parsed") > end), axis=1)].copy()
+
+        result["managers"].append({
+            "name": name,
+            "payments": payments,
+            "expenses": incurred,
+            "settlements_received": received,
+            "settlements_paid": paid,
+            "outstanding": outstanding,
+            "payments_total": float(payments["total"].sum()) if not payments.empty else 0.0,
+            "expenses_total": float(incurred["amount"].sum()) if not incurred.empty else 0.0,
+            "settlements_received_total": float(received["amount"].sum()) if not received.empty else 0.0,
+            "settlements_paid_total": float(paid["amount"].sum()) if not paid.empty else 0.0,
+            "outstanding_total": float(outstanding["amount"].sum()) if not outstanding.empty else 0.0,
+        })
+    return result
+
+
+def build_monthly_statement_pdf(statement: dict) -> bytes:
+    buffer = BytesIO()
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("StmtTitle", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=15, leading=18)
+    h_style = ParagraphStyle("StmtH", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, leading=13, spaceBefore=7, spaceAfter=3)
+    small = ParagraphStyle("StmtSmall", parent=styles["BodyText"], fontSize=7.5, leading=9)
+    right = ParagraphStyle("StmtRight", parent=small, alignment=TA_RIGHT)
+    story = [Paragraph(escape(BUSINESS_NAME), title_style), Paragraph(
+        f"Monthly statement - {statement['start'].strftime('%B %Y')}", h_style), Spacer(1, 4)]
+
+    for mgr in statement["managers"]:
+        story.append(Paragraph(escape(mgr["name"]), h_style))
+        summary = [
+            ["Customer payments received", money(mgr["payments_total"])],
+            ["Expenses incurred", money(mgr["expenses_total"])],
+            ["Expense/salary settlements received", money(mgr["settlements_received_total"])],
+            ["Settlements paid to others", money(mgr["settlements_paid_total"])],
+            ["Outstanding owed to manager", money(mgr["outstanding_total"])],
+        ]
+        t = Table([[Paragraph(str(a), small), Paragraph(str(b), right)] for a,b in summary], colWidths=[4.6*inch, 1.3*inch])
+        t.setStyle(TableStyle([("LINEBELOW",(0,-1),(-1,-1),.6,colors.HexColor("#888888")),("TOPPADDING",(0,0),(-1,-1),2),("BOTTOMPADDING",(0,0),(-1,-1),2)]))
+        story.append(t)
+
+        if not mgr["payments"].empty:
+            story.append(Paragraph("Payments received", small))
+            rows=[["Date","Invoice / customer","Method","Amount"]]
+            for _,r in mgr["payments"].iterrows():
+                dt=r.get("paid_local"); d=dt.strftime("%m/%d/%Y") if dt else ""
+                rows.append([d, f"{r.get('invoice_number','')} - {r.get('customer') or ''}", str(r.get('payment_method') or ''), money(r.get('total') or 0)])
+            tt=Table(rows,colWidths=[.8*inch,3.2*inch,1*inch,.9*inch],repeatRows=1)
+            tt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EEEEEE")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("ALIGN",(-1,1),(-1,-1),"RIGHT"),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD"))]))
+            story.append(tt)
+
+        if not mgr["expenses"].empty:
+            story.append(Paragraph("Expenses incurred", small))
+            rows=[["Date","Category / details","Settlement","Amount"]]
+            for _,r in mgr["expenses"].iterrows():
+                details=str(r.get("description") or "")
+                if str(r.get("category"))=="Salary":
+                    details=f"{float(r.get('hours') or 0):g} hr x {money(r.get('wage_per_hour') or 0)}/hr" + (f" - {details}" if details else "")
+                settlement="Paid" if bool(r.get("reimbursed")) else "Outstanding"
+                if bool(r.get("reimbursed")) and r.get("paid_by"):
+                    settlement += f" by {r.get('paid_by')}"
+                rows.append([str(r.get("expense_date") or ""), f"{r.get('category')} - {details}".strip(" -"), settlement, money(r.get("amount") or 0)])
+            tt=Table(rows,colWidths=[.8*inch,3.2*inch,1*inch,.9*inch],repeatRows=1)
+            tt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EEEEEE")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("ALIGN",(-1,1),(-1,-1),"RIGHT"),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD"))]))
+            story.append(tt)
+        story.append(Spacer(1, 7))
+
+    doc=SimpleDocTemplate(buffer,pagesize=LETTER,rightMargin=.45*inch,leftMargin=.45*inch,topMargin=.45*inch,bottomMargin=.45*inch,title=f"{BUSINESS_NAME} monthly statement")
+    doc.build(story)
+    return buffer.getvalue()
+
+
 def cart_item_is_piece(item: dict) -> bool:
     return str(item.get("option") or "").strip().casefold() == "piece"
 
@@ -1375,7 +1546,7 @@ with manager_tab:
             st.session_state.show_manager_notifications = False
             st.rerun()
 
-        staff_tab, history_tab, menu_tab, announcement_tab, settings_tab = st.tabs(["Staff order", "Order history", "Menu", "Announcements", "Settings"])
+        staff_tab, history_tab, menu_tab, expenditure_tab, announcement_tab, settings_tab = st.tabs(["Staff order", "Order history", "Menu", "Expenditure", "Announcements", "Settings"])
 
         with staff_tab:
             if menu.empty:
@@ -1818,6 +1989,137 @@ with manager_tab:
                             st.error(f"Could not update dish: {exc}")
 
                 st.caption("You can select multiple formats for the same dish, for example **Box + Half Tray + Tray**. Existing special formats are preserved unless we explicitly convert them later.")
+
+        with expenditure_tab:
+            st.subheader("Expenditure")
+            st.caption("Record business expenses, salary, reimbursements, and monthly manager cash-flow statements.")
+
+            with st.form("new_expense_form", clear_on_submit=True):
+                x1, x2, x3 = st.columns(3)
+                expense_category = x1.selectbox("Expense category", ["Bazaar", "Salary", "Equipment", "Misc"])
+                person_label = "Salary for" if expense_category == "Salary" else "Expense by"
+                expense_person = x2.selectbox(person_label, managers if managers else [""])
+                expense_date_value = x3.date_input("Expense date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(), format="MM/DD/YYYY")
+
+                wage = hours = None
+                amount = 0.0
+                if expense_category == "Salary":
+                    s1, s2 = st.columns(2)
+                    wage = s1.number_input("Wage / hour", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+                    hours = s2.number_input("Hours", min_value=0.001, value=1.0, step=0.25, format="%.3f", help="Decimals are allowed, e.g. 1.5, 2.25, 7.75 hours.")
+                    amount = round(float(wage) * float(hours), 2)
+                    st.markdown(f"**Calculated salary: {money(amount)}**")
+                else:
+                    amount = st.number_input("Amount", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+
+                description = st.text_input("Description / note", placeholder="Example: Costco groceries, new pot, August kitchen hours")
+                settled = st.checkbox("This person has already received the payment / reimbursement", value=False)
+                settled_date = None
+                paid_by = None
+                if settled:
+                    y1, y2 = st.columns(2)
+                    settled_date = y1.date_input("Paid / reimbursed date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(), format="MM/DD/YYYY")
+                    paid_by = y2.selectbox("Paid by", managers if managers else [""])
+
+                save_exp = st.form_submit_button("Save expenditure", type="primary", use_container_width=True)
+                if save_exp:
+                    if not expense_person:
+                        st.error("Select the manager/person for this expense.")
+                    elif float(amount) <= 0:
+                        st.error("Expense amount must be greater than zero.")
+                    elif settled and not paid_by:
+                        st.error("Select who paid/reimbursed this expense.")
+                    else:
+                        try:
+                            save_expense(expense_category, expense_person, expense_date_value, description,
+                                         float(amount), wage if expense_category == "Salary" else None,
+                                         hours if expense_category == "Salary" else None,
+                                         settled, settled_date, paid_by)
+                            st.success("Expenditure saved.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not save expenditure: {exc}")
+
+            st.markdown("#### Recent expenditures")
+            try:
+                expense_df = load_expenses()
+            except Exception as exc:
+                expense_df = pd.DataFrame()
+                st.error(f"Could not load expenditures: {exc}")
+            if expense_df.empty:
+                st.info("No expenditures recorded yet.")
+            else:
+                exp_display = expense_df.head(100).copy()
+                exp_display["Status"] = exp_display["reimbursed"].apply(lambda x: "Paid / settled" if bool(x) else "Outstanding")
+                exp_display["Amount"] = exp_display["amount"].apply(lambda x: money(x or 0))
+                exp_display = exp_display.rename(columns={"expense_date":"Date","category":"Category","expense_by":"Person","description":"Details","paid_by":"Paid by","reimbursed_date":"Paid date"})
+                cols=[c for c in ["Date","Category","Person","Details","Amount","Status","Paid date","Paid by"] if c in exp_display.columns]
+                st.dataframe(exp_display[cols], use_container_width=True, hide_index=True)
+
+                outstanding_df = expense_df[expense_df["reimbursed"] != True].copy()
+                if not outstanding_df.empty:
+                    st.markdown("#### Mark an outstanding expense as paid")
+                    outstanding_ids = outstanding_df["id"].astype(int).tolist()
+                    settle_id = st.selectbox(
+                        "Outstanding expense",
+                        outstanding_ids,
+                        format_func=lambda eid: (
+                            f"{outstanding_df.loc[outstanding_df['id']==eid, 'expense_date'].iloc[0]} · "
+                            f"{outstanding_df.loc[outstanding_df['id']==eid, 'expense_by'].iloc[0]} · "
+                            f"{outstanding_df.loc[outstanding_df['id']==eid, 'category'].iloc[0]} · "
+                            f"{money(outstanding_df.loc[outstanding_df['id']==eid, 'amount'].iloc[0])}"
+                        ),
+                        key="settle_expense_id",
+                    )
+                    z1,z2,z3 = st.columns([1.4,1.4,1])
+                    settle_date_value = z1.date_input("Payment date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(), format="MM/DD/YYYY", key="settle_expense_date")
+                    settle_paid_by = z2.selectbox("Paid by", managers if managers else [""], key="settle_expense_paid_by")
+                    z3.write(""); z3.write("")
+                    if z3.button("Mark paid", type="primary", use_container_width=True, key="settle_expense_button"):
+                        try:
+                            settle_expense(int(settle_id), settle_date_value, settle_paid_by)
+                            st.success("Expense marked as paid / settled.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not settle expense: {exc}")
+
+            st.markdown("### Monthly statement")
+            now_local = datetime.now(ZoneInfo(APP_TIMEZONE))
+            m1, m2 = st.columns(2)
+            statement_month = m1.selectbox("Month", list(range(1,13)), index=now_local.month-1, format_func=lambda m: date(2000,m,1).strftime("%B"))
+            year_choices = list(range(now_local.year - 3, now_local.year + 2))
+            statement_year = m2.selectbox("Year", year_choices, index=year_choices.index(now_local.year))
+            try:
+                statement = monthly_manager_statement(int(statement_year), int(statement_month), managers)
+                for mgr in statement["managers"]:
+                    with st.expander(mgr["name"], expanded=True):
+                        a,b,c,d,e = st.columns(5)
+                        a.metric("Payments received", money(mgr["payments_total"]))
+                        b.metric("Expenses", money(mgr["expenses_total"]))
+                        c.metric("Settlements received", money(mgr["settlements_received_total"]))
+                        d.metric("Settlements paid", money(mgr["settlements_paid_total"]))
+                        e.metric("Outstanding", money(mgr["outstanding_total"]))
+
+                        if not mgr["payments"].empty:
+                            st.caption("Customer payments received")
+                            pdsp = mgr["payments"].copy()
+                            pdsp["Date"] = pdsp["paid_local"].apply(lambda x: x.strftime("%m/%d/%Y") if x else "")
+                            pdsp["Amount"] = pdsp["total"].apply(money)
+                            pdsp = pdsp.rename(columns={"invoice_number":"Invoice","customer":"Customer","payment_method":"Method"})
+                            st.dataframe(pdsp[["Date","Invoice","Customer","Method","Amount"]], hide_index=True, use_container_width=True)
+                        if not mgr["expenses"].empty:
+                            st.caption("Expenses incurred")
+                            edsp = mgr["expenses"].copy()
+                            edsp["Amount"] = edsp["amount"].apply(money)
+                            edsp["Status"] = edsp["reimbursed"].apply(lambda x: "Paid / settled" if bool(x) else "Outstanding")
+                            edsp = edsp.rename(columns={"expense_date":"Date","category":"Category","description":"Details","paid_by":"Paid by","reimbursed_date":"Paid date"})
+                            st.dataframe(edsp[["Date","Category","Details","Amount","Status","Paid date","Paid by"]], hide_index=True, use_container_width=True)
+
+                statement_pdf = build_monthly_statement_pdf(statement)
+                filename = f"{BUSINESS_NAME.replace(' ', '_')}_statement_{statement_year}_{int(statement_month):02d}.pdf"
+                st.download_button("Download monthly statement PDF", data=statement_pdf, file_name=filename, mime="application/pdf", type="primary", use_container_width=True)
+            except Exception as exc:
+                st.error(f"Could not generate monthly statement: {exc}")
 
         with announcement_tab:
             st.subheader("Customer announcements")

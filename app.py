@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, date, timedelta, time
 from fractions import Fraction
 from html import escape
-from io import BytesIO
+from io import BytesIO, StringIO
+import csv
 from zoneinfo import ZoneInfo
 import os
 import json
@@ -1170,6 +1171,77 @@ def monthly_manager_statement(year: int, month: int, managers_list: list[str]) -
     return result
 
 
+def build_monthly_statement_csv(statement: dict) -> bytes:
+    """Build a manager-grouped monthly cash-flow statement as UTF-8 CSV."""
+    output = StringIO()
+    writer = csv.writer(output)
+    month_label = statement["start"].strftime("%B %Y")
+
+    writer.writerow([BUSINESS_NAME])
+    writer.writerow(["Monthly statement", month_label])
+    writer.writerow([])
+    writer.writerow([
+        "Manager", "Entry type", "Date", "Reference / category", "Details",
+        "Income", "Expense", "Settlement / transfer", "Status / counterparty"
+    ])
+
+    total_income = 0.0
+    total_expense = 0.0
+
+    for mgr in statement["managers"]:
+        name = mgr["name"]
+
+        if not mgr["payments"].empty:
+            for _, row in mgr["payments"].iterrows():
+                paid_dt = row.get("paid_local")
+                paid_date = paid_dt.strftime("%m/%d/%Y") if paid_dt else ""
+                amount = float(row.get("total") or 0)
+                total_income += amount
+                reference = str(row.get("invoice_number") or "")
+                customer = str(row.get("customer") or "")
+                method = str(row.get("payment_method") or "")
+                writer.writerow([name, "Customer payment received", paid_date, reference, customer, f"{amount:.2f}", "", "", method])
+
+        if not mgr["expenses"].empty:
+            for _, row in mgr["expenses"].iterrows():
+                amount = float(row.get("amount") or 0)
+                total_expense += amount
+                status = "Paid / settled" if bool(row.get("reimbursed")) else "Outstanding"
+                paid_by = str(row.get("paid_by") or "")
+                if paid_by:
+                    status += f"; paid by {paid_by}"
+                details = str(row.get("description") or "")
+                if str(row.get("category") or "") == "Salary":
+                    wage = float(row.get("wage_per_hour") or 0)
+                    hours = float(row.get("hours") or 0)
+                    salary_detail = f"{hours:g} hr × {CURRENCY}{wage:.2f}/hr"
+                    details = f"{salary_detail}; {details}" if details else salary_detail
+                writer.writerow([name, "Expense incurred", str(row.get("expense_date") or ""), str(row.get("category") or ""), details, "", f"{amount:.2f}", "", status])
+
+        if not mgr["settlements_received"].empty:
+            for _, row in mgr["settlements_received"].iterrows():
+                amount = float(row.get("amount") or 0)
+                writer.writerow([
+                    name, "Expense / salary settlement received", str(row.get("reimbursed_date") or ""),
+                    str(row.get("category") or ""), str(row.get("description") or ""), "", "", f"{amount:.2f}",
+                    f"Received from {str(row.get('paid_by') or '')}".strip()
+                ])
+
+        if not mgr["settlements_paid"].empty:
+            for _, row in mgr["settlements_paid"].iterrows():
+                amount = float(row.get("amount") or 0)
+                recipient = str(row.get("expense_by") or "")
+                writer.writerow([
+                    name, "Settlement paid", str(row.get("reimbursed_date") or ""),
+                    str(row.get("category") or ""), str(row.get("description") or ""), "", "", f"{amount:.2f}",
+                    f"Paid to {recipient}" if recipient else ""
+                ])
+
+    writer.writerow([])
+    writer.writerow(["TOTAL", "Monthly totals", "", "", "", f"{total_income:.2f}", f"{total_expense:.2f}", "", ""])
+    return output.getvalue().encode("utf-8-sig")
+
+
 def build_monthly_statement_pdf(statement: dict) -> bytes:
     buffer = BytesIO()
     styles = getSampleStyleSheet()
@@ -1994,51 +2066,90 @@ with manager_tab:
             st.subheader("Expenditure")
             st.caption("Record business expenses, salary, reimbursements, and monthly manager cash-flow statements.")
 
-            with st.form("new_expense_form", clear_on_submit=True):
-                x1, x2, x3 = st.columns(3)
-                expense_category = x1.selectbox("Expense category", ["Bazaar", "Salary", "Equipment", "Misc"])
-                person_label = "Salary for" if expense_category == "Salary" else "Expense by"
-                expense_person = x2.selectbox(person_label, managers if managers else [""])
-                expense_date_value = x3.date_input("Expense date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(), format="MM/DD/YYYY")
+            # These controls intentionally live outside st.form so dependent fields
+            # appear immediately when Category or the reimbursement checkbox changes.
+            expense_widget_keys = [
+                "expense_category", "expense_person", "expense_date_value", "expense_wage",
+                "expense_hours", "expense_amount", "expense_description", "expense_settled",
+                "expense_settled_date", "expense_paid_by"
+            ]
+            if st.session_state.pop("_reset_expense_entry", False):
+                for key in expense_widget_keys:
+                    st.session_state.pop(key, None)
 
-                wage = hours = None
-                amount = 0.0
-                if expense_category == "Salary":
-                    s1, s2 = st.columns(2)
-                    wage = s1.number_input("Wage / hour", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-                    hours = s2.number_input("Hours", min_value=0.001, value=1.0, step=0.25, format="%.3f", help="Decimals are allowed, e.g. 1.5, 2.25, 7.75 hours.")
-                    amount = round(float(wage) * float(hours), 2)
-                    st.markdown(f"**Calculated salary: {money(amount)}**")
+            x1, x2, x3 = st.columns(3)
+            expense_category = x1.selectbox(
+                "Expense category", ["Bazaar", "Salary", "Equipment", "Misc"],
+                key="expense_category"
+            )
+            person_label = "Salary for" if expense_category == "Salary" else "Expense by"
+            expense_person = x2.selectbox(person_label, managers if managers else [""], key="expense_person")
+            expense_date_value = x3.date_input(
+                "Expense date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(),
+                format="MM/DD/YYYY", key="expense_date_value"
+            )
+
+            wage = hours = None
+            amount = 0.0
+            if expense_category == "Salary":
+                s1, s2 = st.columns(2)
+                wage = s1.number_input(
+                    "Wage / hour", min_value=0.0, value=0.0, step=0.5, format="%.2f",
+                    key="expense_wage"
+                )
+                hours = s2.number_input(
+                    "Hours", min_value=0.001, value=1.0, step=0.25, format="%.3f",
+                    help="Fractions/decimals are allowed, e.g. 1.5, 2.25, 7.75 hours.",
+                    key="expense_hours"
+                )
+                amount = round(float(wage) * float(hours), 2)
+                st.markdown(f"**Calculated salary: {money(amount)}**")
+            else:
+                amount = st.number_input(
+                    "Amount", min_value=0.0, value=0.0, step=1.0, format="%.2f",
+                    key="expense_amount"
+                )
+
+            description = st.text_input(
+                "Description / note",
+                placeholder="Example: Costco groceries, new pot, August kitchen hours",
+                key="expense_description"
+            )
+            settled = st.checkbox(
+                "This person has already received the payment / reimbursement",
+                value=False, key="expense_settled"
+            )
+            settled_date = None
+            paid_by = None
+            if settled:
+                y1, y2 = st.columns(2)
+                settled_date = y1.date_input(
+                    "Paid / reimbursed date",
+                    value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(),
+                    format="MM/DD/YYYY", key="expense_settled_date"
+                )
+                paid_by = y2.selectbox("Paid by", managers if managers else [""], key="expense_paid_by")
+
+            if st.button("Save expenditure", type="primary", use_container_width=True, key="save_expenditure_button"):
+                if not expense_person:
+                    st.error("Select the manager/person for this expense.")
+                elif float(amount) <= 0:
+                    st.error("Expense amount must be greater than zero.")
+                elif settled and not paid_by:
+                    st.error("Select who paid/reimbursed this expense.")
                 else:
-                    amount = st.number_input("Amount", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-
-                description = st.text_input("Description / note", placeholder="Example: Costco groceries, new pot, August kitchen hours")
-                settled = st.checkbox("This person has already received the payment / reimbursement", value=False)
-                settled_date = None
-                paid_by = None
-                if settled:
-                    y1, y2 = st.columns(2)
-                    settled_date = y1.date_input("Paid / reimbursed date", value=datetime.now(ZoneInfo(APP_TIMEZONE)).date(), format="MM/DD/YYYY")
-                    paid_by = y2.selectbox("Paid by", managers if managers else [""])
-
-                save_exp = st.form_submit_button("Save expenditure", type="primary", use_container_width=True)
-                if save_exp:
-                    if not expense_person:
-                        st.error("Select the manager/person for this expense.")
-                    elif float(amount) <= 0:
-                        st.error("Expense amount must be greater than zero.")
-                    elif settled and not paid_by:
-                        st.error("Select who paid/reimbursed this expense.")
-                    else:
-                        try:
-                            save_expense(expense_category, expense_person, expense_date_value, description,
-                                         float(amount), wage if expense_category == "Salary" else None,
-                                         hours if expense_category == "Salary" else None,
-                                         settled, settled_date, paid_by)
-                            st.success("Expenditure saved.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not save expenditure: {exc}")
+                    try:
+                        save_expense(
+                            expense_category, expense_person, expense_date_value, description,
+                            float(amount), wage if expense_category == "Salary" else None,
+                            hours if expense_category == "Salary" else None,
+                            settled, settled_date, paid_by
+                        )
+                        st.session_state["_reset_expense_entry"] = True
+                        st.success("Expenditure saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save expenditure: {exc}")
 
             st.markdown("#### Recent expenditures")
             try:
@@ -2115,9 +2226,22 @@ with manager_tab:
                             edsp = edsp.rename(columns={"expense_date":"Date","category":"Category","description":"Details","paid_by":"Paid by","reimbursed_date":"Paid date"})
                             st.dataframe(edsp[["Date","Category","Details","Amount","Status","Paid date","Paid by"]], hide_index=True, use_container_width=True)
 
-                statement_pdf = build_monthly_statement_pdf(statement)
-                filename = f"{BUSINESS_NAME.replace(' ', '_')}_statement_{statement_year}_{int(statement_month):02d}.pdf"
-                st.download_button("Download monthly statement PDF", data=statement_pdf, file_name=filename, mime="application/pdf", type="primary", use_container_width=True)
+                overall_income = sum(float(mgr["payments_total"]) for mgr in statement["managers"])
+                overall_expense = sum(float(mgr["expenses_total"]) for mgr in statement["managers"])
+                st.markdown("#### Monthly totals")
+                totals_display = pd.DataFrame([{
+                    "Manager": "TOTAL",
+                    "Income": money(overall_income),
+                    "Expenses": money(overall_expense),
+                }])
+                st.dataframe(totals_display, hide_index=True, use_container_width=True)
+
+                statement_csv = build_monthly_statement_csv(statement)
+                filename = f"{BUSINESS_NAME.replace(' ', '_')}_statement_{statement_year}_{int(statement_month):02d}.csv"
+                st.download_button(
+                    "Download monthly statement CSV", data=statement_csv, file_name=filename,
+                    mime="text/csv", type="primary", use_container_width=True
+                )
             except Exception as exc:
                 st.error(f"Could not generate monthly statement: {exc}")
 

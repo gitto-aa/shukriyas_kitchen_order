@@ -14,7 +14,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
@@ -230,6 +229,11 @@ def load_store_settings() -> dict[str, str]:
 def save_store_setting(key: str, value: str) -> None:
     get_db().table("store_settings").upsert({"key": key, "value": value.strip()}, on_conflict="key").execute()
     load_store_settings.clear()
+    # Invoice rendering depends on kitchen settings such as the printed address.
+    for cached_fn_name in ("build_invoice_pdf", "build_invoice_print_html"):
+        cached_fn = globals().get(cached_fn_name)
+        if cached_fn is not None and hasattr(cached_fn, "clear"):
+            cached_fn.clear()
 
 
 def kitchen_address() -> str:
@@ -300,11 +304,7 @@ def resolve_customer_code(name: str, phone: str = "") -> str:
     return code
 
 
-def delivery_date_options(days: int = 120) -> list[date]:
-    today = datetime.now(ZoneInfo(APP_TIMEZONE)).date()
-    return [today + timedelta(days=i) for i in range(days)]
-
-
+@st.cache_data(show_spinner=False)
 def delivery_time_options(start_hour: int = 8, end_hour: int = 22, step_minutes: int = 30) -> list[time]:
     out = []
     minutes = start_hour * 60
@@ -390,7 +390,7 @@ def render_customer_announcements() -> None:
             st.info(body, icon="📣")
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def load_recent_orders(limit: int = 100) -> pd.DataFrame:
     response = (
         get_db().table("orders")
@@ -488,6 +488,7 @@ def payment_details_for_invoice(order: dict) -> dict:
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def build_invoice_pdf(order: dict) -> bytes:
     """Create a compact, invoice-style PDF with minimal unused page space."""
     buffer = BytesIO()
@@ -780,6 +781,7 @@ def build_invoice_pdf(order: dict) -> bytes:
 
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def build_invoice_print_html(order: dict) -> str:
     """Build a compact, print-friendly HTML invoice for direct browser printing."""
     payment = payment_details_for_invoice(order)
@@ -985,6 +987,7 @@ def render_print_button(order: dict, label: str = "🖨️ Print invoice") -> No
     )
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_order_for_pdf(order_id: int) -> dict:
     db = get_db()
     row = db.table("orders").select("*").eq("id", order_id).single().execute().data
@@ -1029,6 +1032,9 @@ def update_order_details(order_id: int, customer: str, phone: str, delivery_date
         "delivery_date": delivery_date_value.isoformat() if delivery_date_value else None,
         "delivery_time": delivery_time_value.strftime("%H:%M:%S") if delivery_time_value else None,
     }).eq("id", int(order_id)).execute()
+    fetch_order_for_pdf.clear()
+    build_invoice_pdf.clear()
+    build_invoice_print_html.clear()
     load_recent_orders.clear()
 
 
@@ -1053,6 +1059,10 @@ def create_public_order(customer, phone, address, notes, cart):
 def update_order_payment(order_id, status, method, receiver):
     r = get_db().rpc("update_order_payment", {"p_order_id": int(order_id), "p_payment_status": status,
         "p_payment_method": method, "p_received_by": receiver}).execute()
+    fetch_order_for_pdf.clear()
+    build_invoice_pdf.clear()
+    build_invoice_print_html.clear()
+    load_paid_orders_for_statements.clear()
     return r.data[0] if isinstance(r.data, list) and r.data else r.data
 
 
@@ -1250,66 +1260,9 @@ def build_monthly_statement_csv(statement: dict) -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
-def build_monthly_statement_pdf(statement: dict) -> bytes:
-    buffer = BytesIO()
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("StmtTitle", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=15, leading=18)
-    h_style = ParagraphStyle("StmtH", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, leading=13, spaceBefore=7, spaceAfter=3)
-    small = ParagraphStyle("StmtSmall", parent=styles["BodyText"], fontSize=7.5, leading=9)
-    right = ParagraphStyle("StmtRight", parent=small, alignment=TA_RIGHT)
-    story = [Paragraph(escape(BUSINESS_NAME), title_style), Paragraph(
-        f"Monthly statement - {statement['start'].strftime('%B %Y')}", h_style), Spacer(1, 4)]
-
-    for mgr in statement["managers"]:
-        story.append(Paragraph(escape(mgr["name"]), h_style))
-        summary = [
-            ["Customer payments received", money(mgr["payments_total"])],
-            ["Expenses incurred", money(mgr["expenses_total"])],
-            ["Expense/salary settlements received", money(mgr["settlements_received_total"])],
-            ["Settlements paid to others", money(mgr["settlements_paid_total"])],
-            ["Outstanding owed to manager", money(mgr["outstanding_total"])],
-        ]
-        t = Table([[Paragraph(str(a), small), Paragraph(str(b), right)] for a,b in summary], colWidths=[4.6*inch, 1.3*inch])
-        t.setStyle(TableStyle([("LINEBELOW",(0,-1),(-1,-1),.6,colors.HexColor("#888888")),("TOPPADDING",(0,0),(-1,-1),2),("BOTTOMPADDING",(0,0),(-1,-1),2)]))
-        story.append(t)
-
-        if not mgr["payments"].empty:
-            story.append(Paragraph("Payments received", small))
-            rows=[["Date","Invoice / customer","Method","Amount"]]
-            for _,r in mgr["payments"].iterrows():
-                dt=r.get("paid_local"); d=dt.strftime("%m/%d/%Y") if dt else ""
-                rows.append([d, f"{r.get('invoice_number','')} - {r.get('customer') or ''}", str(r.get('payment_method') or ''), money(r.get('total') or 0)])
-            tt=Table(rows,colWidths=[.8*inch,3.2*inch,1*inch,.9*inch],repeatRows=1)
-            tt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EEEEEE")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("ALIGN",(-1,1),(-1,-1),"RIGHT"),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD"))]))
-            story.append(tt)
-
-        if not mgr["expenses"].empty:
-            story.append(Paragraph("Expenses incurred", small))
-            rows=[["Date","Category / details","Settlement","Amount"]]
-            for _,r in mgr["expenses"].iterrows():
-                details=str(r.get("description") or "")
-                if str(r.get("category"))=="Salary":
-                    details=f"{float(r.get('hours') or 0):g} hr x {money(r.get('wage_per_hour') or 0)}/hr" + (f" - {details}" if details else "")
-                settlement="Paid" if bool(r.get("reimbursed")) else "Outstanding"
-                if bool(r.get("reimbursed")) and r.get("paid_by"):
-                    settlement += f" by {r.get('paid_by')}"
-                rows.append([str(r.get("expense_date") or ""), f"{r.get('category')} - {details}".strip(" -"), settlement, money(r.get("amount") or 0)])
-            tt=Table(rows,colWidths=[.8*inch,3.2*inch,1*inch,.9*inch],repeatRows=1)
-            tt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EEEEEE")),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("ALIGN",(-1,1),(-1,-1),"RIGHT"),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD"))]))
-            story.append(tt)
-        story.append(Spacer(1, 7))
-
-    doc=SimpleDocTemplate(buffer,pagesize=LETTER,rightMargin=.45*inch,leftMargin=.45*inch,topMargin=.45*inch,bottomMargin=.45*inch,title=f"{BUSINESS_NAME} monthly statement")
-    doc.build(story)
-    return buffer.getvalue()
-
-
 def cart_item_is_piece(item: dict) -> bool:
     return str(item.get("option") or "").strip().casefold() == "piece"
 
-
-def cart_item_is_package(item: dict) -> bool:
-    return not cart_item_is_piece(item)
 
 
 def cart_quantity_label(item: dict, qty: float) -> str:
@@ -1386,21 +1339,12 @@ def manager_notification_center() -> None:
                 )
             if count > 8:
                 st.caption(f"+ {count - 8} more new orders")
-            st.caption("Open Order history to assign or confirm them. The badge clears as orders leave New status.")
+            st.caption("Open Order history to review or confirm them. The badge clears as orders leave New status.")
 
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     st.title(f"🍽️ {BUSINESS_NAME} Orders")
     st.error("Supabase credentials are not configured.")
-    st.stop()
-
-try:
-    menu = load_menu()
-    public_menu = load_public_menu()
-    managers = load_managers()
-except Exception as exc:
-    st.title(f"🍽️ {BUSINESS_NAME}")
-    st.error(f"Could not connect to the ordering database: {exc}")
     st.stop()
 
 for key, default in [("public_cart", []), ("staff_cart", []), ("public_confirmation", None), ("staff_invoice", None), ("manager_authenticated", False), ("show_manager_notifications", False)]:
@@ -1409,9 +1353,31 @@ for key, default in [("public_cart", []), ("staff_cart", []), ("public_confirmat
 
 st.title(f"🍽️ {BUSINESS_NAME}")
 st.caption("Browse the menu and place an order online, or sign in to the manager area.")
-public_tab, manager_tab = st.tabs(["🍽️ Menu & Order", "🔐 Manager"])
+app_section = st.radio(
+    "App section",
+    ["🍽️ Menu & Order", "🔐 Manager"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="app_section",
+)
 
-with public_tab:
+# Load only the data needed by the visible section. Streamlit tabs execute hidden
+# content too; this lazy navigation avoids unnecessary database work on reruns.
+menu = pd.DataFrame()
+public_menu = pd.DataFrame()
+managers: list[str] = []
+try:
+    if app_section == "🍽️ Menu & Order":
+        public_menu = load_public_menu()
+    elif st.session_state.manager_authenticated or not APP_PASSWORD:
+        menu = load_menu()
+        public_menu = load_public_menu()
+        managers = load_managers()
+except Exception as exc:
+    st.error(f"Could not connect to the ordering database: {exc}")
+    st.stop()
+
+if app_section == "🍽️ Menu & Order":
     render_customer_announcements()
     if public_menu.empty:
         st.info("The online menu is not available yet.")
@@ -1604,7 +1570,7 @@ with public_tab:
             st.download_button("Download order confirmation", data=conf["pdf"], file_name=f"{conf['number']}.pdf",
                                mime="application/pdf", use_container_width=True)
 
-with manager_tab:
+if app_section == "🔐 Manager":
     if not st.session_state.manager_authenticated and APP_PASSWORD:
         st.subheader("Manager sign in")
         entered = st.text_input("Manager password", type="password", key="manager_password_input")
@@ -1626,9 +1592,15 @@ with manager_tab:
             st.session_state.show_manager_notifications = False
             st.rerun()
 
-        staff_tab, history_tab, menu_tab, expenditure_tab, announcement_tab, settings_tab = st.tabs(["Staff order", "Order history", "Menu", "Expenditure", "Announcements", "Settings"])
+        manager_section = st.radio(
+            "Manager section",
+            ["Staff order", "Order history", "Menu", "Expenditure", "Announcements", "Settings"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="manager_section",
+        )
 
-        with staff_tab:
+        if manager_section == "Staff order":
             if menu.empty:
                 st.warning("No available menu items.")
             else:
@@ -1784,7 +1756,7 @@ with manager_tab:
                             render_print_button(inv["order"])
 
 
-        with history_tab:
+        if manager_section == "Order history":
             h1,h2 = st.columns([3,1]); h1.subheader("Recent orders")
             if h2.button("Refresh", use_container_width=True): load_recent_orders.clear(); st.rerun()
             orders = load_recent_orders()
@@ -1913,7 +1885,7 @@ with manager_tab:
                         components.html(build_invoice_print_html(old), height=650, scrolling=True)
                 except Exception as exc: st.warning(f"Could not prepare invoice: {exc}")
 
-        with menu_tab:
+        if manager_section == "Menu":
             st.subheader("Menu management")
             st.caption("A dish can be sold in one or several formats. Select every format that applies and set its price.")
 
@@ -2070,14 +2042,14 @@ with manager_tab:
 
                 st.caption("You can select multiple formats for the same dish, for example **Box + Half Tray + Tray**. Existing special formats are preserved unless we explicitly convert them later.")
 
-        with expenditure_tab:
+        if manager_section == "Expenditure":
             st.subheader("Expenditure")
             st.caption("Record business expenses, salary, reimbursements, and monthly manager cash-flow statements.")
 
             # These controls intentionally live outside st.form so dependent fields
             # appear immediately when Category or the reimbursement checkbox changes.
             expense_widget_keys = [
-                "expense_category", "expense_person", "expense_date_value", "expense_wage",
+                "expense_category", "expense_person", "expense_date_value",
                 "expense_hours", "expense_amount", "expense_description", "expense_settled",
                 "expense_settled_date", "expense_paid_by"
             ]
@@ -2100,18 +2072,18 @@ with manager_tab:
             wage = hours = None
             amount = 0.0
             if expense_category == "Salary":
-                s1, s2 = st.columns(2)
-                wage = s1.number_input(
-                    "Wage / hour", min_value=0.0, value=float(default_hourly_salary()), step=0.5, format="%.2f",
-                    help="Defaults to the hourly salary saved in Settings. You can override it for this entry.",
-                    key="expense_wage"
-                )
+                wage = float(default_hourly_salary())
+                s1, s2 = st.columns([1.1, 1.4])
+                s1.metric("Hourly rate", money(wage))
+                s1.caption("Set in Manager → Settings")
                 hours = s2.number_input(
                     "Hours", min_value=0.001, value=1.0, step=0.25, format="%.3f",
                     help="Fractions/decimals are allowed, e.g. 1.5, 2.25, 7.75 hours.",
                     key="expense_hours"
                 )
                 amount = round(float(wage) * float(hours), 2)
+                if wage <= 0:
+                    st.warning("Set the hourly salary in Settings before saving a Salary expense.")
                 st.markdown(f"**Calculated salary: {money(amount)}**")
             else:
                 amount = st.number_input(
@@ -2142,6 +2114,8 @@ with manager_tab:
             if st.button("Save expenditure", type="primary", use_container_width=True, key="save_expenditure_button"):
                 if not expense_person:
                     st.error("Select the manager/person for this expense.")
+                elif expense_category == "Salary" and float(wage or 0) <= 0:
+                    st.error("Set the hourly salary in Settings before saving a Salary expense.")
                 elif float(amount) <= 0:
                     st.error("Expense amount must be greater than zero.")
                 elif settled and not paid_by:
@@ -2254,7 +2228,7 @@ with manager_tab:
             except Exception as exc:
                 st.error(f"Could not generate monthly statement: {exc}")
 
-        with announcement_tab:
+        if manager_section == "Announcements":
             st.subheader("Customer announcements")
             st.caption("Active announcements appear at the top of the public Menu & Order page.")
 
@@ -2316,7 +2290,7 @@ with manager_tab:
                                 except Exception as exc:
                                     st.error(f"Could not update announcement: {exc}")
 
-        with settings_tab:
+        if manager_section == "Settings":
             st.subheader("Kitchen settings")
             current_settings = load_store_settings()
 
@@ -2345,14 +2319,12 @@ with manager_tab:
                 value=float(saved_hourly),
                 step=0.5,
                 format="%.2f",
-                help="This rate automatically fills Wage / hour when Salary is selected under Expenditure.",
+                help="This saved rate is used automatically for all new Salary expenditure entries.",
                 key="settings_hourly_salary",
             )
             if st.button("Save hourly salary", type="primary", use_container_width=True, key="save_hourly_salary"):
                 try:
                     save_store_setting("hourly_salary", f"{float(hourly_salary):.2f}")
-                    # Reset the salary-entry wage so the newly saved default is picked up next time.
-                    st.session_state.pop("expense_wage", None)
                     st.success("Default hourly salary saved.")
                     st.rerun()
                 except Exception as exc:
